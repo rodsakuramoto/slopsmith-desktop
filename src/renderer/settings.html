@@ -59,12 +59,25 @@
         <label class="block text-xs text-slate-400 mb-1">Saved Presets</label>
         <div id="ae-preset-list" class="space-y-1 max-h-40 overflow-y-auto"></div>
     </div>
-    <div id="ae-tone-switching" class="hidden">
-        <label class="block text-xs text-slate-400 mb-1">Tone Switching</label>
-        <div id="ae-tone-mappings" class="space-y-1 mb-2"></div>
-        <label class="flex items-center gap-2 text-xs text-slate-400 cursor-pointer">
-            <input type="checkbox" id="ae-auto-switch" class="accent-blue-500">
-            Auto-switch chain on tone changes during playback
-        </label>
+    <div id="ae-tone-automation" class="border-t border-slate-700 pt-3">
+        <div class="text-xs font-semibold text-slate-300 mb-1">Tone Automation</div>
+        <p class="text-xs text-slate-500 mb-3">
+            Configure keyword filters and preset targets here. Turn Tone Automation on or off from the Chain panel (Mode → Tone Automation).
+        </p>
+        <p class="text-xs text-slate-500 mb-3">
+            Selects a target preset based on keywords found in song titles, tone names, or text inputs.
+            Precedence: <span class="text-slate-400">SOLO &gt; DIST &gt; OD &gt; CLEAN &gt; BASS &gt; ACOUSTIC &gt; MOD</span>.
+            If no keyword matches, the Idle Target is loaded.
+        </p>
+
+        <div class="mb-3">
+            <div class="text-xs text-slate-400 mb-2">Auto Classifier Filters</div>
+            <div id="ae-ta-filters" class="space-y-2"></div>
+        </div>
+
+        <div>
+            <div class="text-xs text-slate-400 mb-2">Target Mapping</div>
+            <div id="ae-ta-targets" class="space-y-1.5"></div>
+        </div>
     </div>
 </div>

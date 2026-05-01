@@ -54,6 +54,35 @@
     const pitchCentsBar = $('ae-pitch-cents');
     const savePresetBtn = $('ae-save-preset');
 
+    /** Sliders show dB; `api.setGain` and saved presets use linear amplitude gain (legacy presets unchanged). */
+    const GAIN_SLIDER_DB_MIN = -60;
+    const GAIN_SLIDER_DB_MAX = 12;
+
+    function linearGainToDb(lin) {
+        const x = Number(lin);
+        if (!Number.isFinite(x) || x <= 0) return GAIN_SLIDER_DB_MIN;
+        const db = 20 * Math.log10(x);
+        return Math.min(GAIN_SLIDER_DB_MAX, Math.max(GAIN_SLIDER_DB_MIN, db));
+    }
+
+    function dbToLinearGain(db) {
+        const x = Number(db);
+        if (!Number.isFinite(x)) return 1;
+        const clamped = Math.min(GAIN_SLIDER_DB_MAX, Math.max(GAIN_SLIDER_DB_MIN, x));
+        if (clamped <= GAIN_SLIDER_DB_MIN) return 0;
+        return Math.pow(10, clamped / 20);
+    }
+
+    function formatGainDbLabel(db) {
+        const x = Number(db);
+        if (!Number.isFinite(x)) return '0.0 dB';
+        return `${x.toFixed(1)} dB`;
+    }
+
+    window._aeLinearGainToDb = linearGainToDb;
+    window._aeDbToLinearGain = dbToLinearGain;
+    window._aeFormatGainDbLabel = formatGainDbLabel;
+
     // ── Persistence ─────────────────────────────────────────────────────────
     function saveDeviceSettings() {
         localStorage.setItem('slopsmith-audio-device', JSON.stringify({
@@ -141,6 +170,7 @@
             }
         }
         if (savedChain.length > 0) await refreshChain();
+        await loadDefaultPreset('app-init');
     }
 
     function saveChainState() {
@@ -153,6 +183,31 @@
             }));
             localStorage.setItem('slopsmith-signal-chain', JSON.stringify(items));
         }).catch(() => {});
+    }
+
+    function captureCurrentGainLevels() {
+        const inDb = parseFloat(inputGainSlider?.value ?? '0');
+        const outDb = parseFloat(outputGainSlider?.value ?? '0');
+        return {
+            inputGain: dbToLinearGain(inDb),
+            outputGain: dbToLinearGain(outDb),
+        };
+    }
+
+    function applyPresetGainLevels(preset) {
+        const inputLin = Number.isFinite(Number(preset?.inputGain)) ? Number(preset.inputGain) : 1;
+        const outputLin = Number.isFinite(Number(preset?.outputGain)) ? Number(preset.outputGain) : 1;
+
+        const inDb = linearGainToDb(inputLin);
+        const outDb = linearGainToDb(outputLin);
+
+        if (inputGainSlider) inputGainSlider.value = String(inDb);
+        if (outputGainSlider) outputGainSlider.value = String(outDb);
+        if (inputGainLabel) inputGainLabel.textContent = formatGainDbLabel(inDb);
+        if (outputGainLabel) outputGainLabel.textContent = formatGainDbLabel(outDb);
+
+        api.setGain('input', inputLin);
+        api.setGain('output', outputLin);
     }
 
     // ── Device Types ──────────────────────────────────────────────────────────
@@ -202,11 +257,13 @@
 
     // ── Signal Chain ──────────────────────────────────────────────────────────
     async function refreshChain() {
+        const container = chainContainer || $('ae-chain');
+        if (!container) return;
         const chain = await api.getChainState();
-        chainContainer.innerHTML = '';
+        container.innerHTML = '';
 
         if (chain.length === 0) {
-            chainContainer.innerHTML = '<div class="text-sm text-slate-500 italic">No processors loaded — add a VST, NAM model, or cabinet IR</div>';
+            container.innerHTML = '<div class="text-sm text-slate-500 italic">No processors loaded — add a VST, NAM model, or cabinet IR</div>';
             return;
         }
 
@@ -231,7 +288,7 @@
                 <button class="text-xs px-2 py-1 rounded bg-red-600/50 hover:bg-red-500"
                         onclick="_aeRemoveSlot(${slot.id})">Remove</button>
             `;
-            chainContainer.appendChild(div);
+            container.appendChild(div);
         }
     }
 
@@ -403,17 +460,17 @@
             api.setMonitorMute(monitorMuteCheckbox.checked);
         });
 
-        // Gain sliders
+        // Gain sliders (UI dB → linear amplitude for engine)
         inputGainSlider.addEventListener('input', () => {
-            const val = parseFloat(inputGainSlider.value);
-            api.setGain('input', val);
-            inputGainLabel.textContent = val.toFixed(1) + 'x';
+            const db = parseFloat(inputGainSlider.value);
+            api.setGain('input', dbToLinearGain(db));
+            inputGainLabel.textContent = formatGainDbLabel(db);
         });
 
         outputGainSlider.addEventListener('input', () => {
-            const val = parseFloat(outputGainSlider.value);
-            api.setGain('output', val);
-            outputGainLabel.textContent = val.toFixed(1) + 'x';
+            const db = parseFloat(outputGainSlider.value);
+            api.setGain('output', dbToLinearGain(db));
+            outputGainLabel.textContent = formatGainDbLabel(db);
         });
 
         // Add VST
@@ -506,15 +563,21 @@
                     path: s.path || '',
                     name: s.name || '',
                 }));
+                const gains = captureCurrentGainLevels();
                 const presets = JSON.parse(localStorage.getItem('slopsmith-chain-presets') || '{}');
-                presets[name] = { nativePreset, items, created: Date.now() };
+                presets[name] = { nativePreset, items, ...gains, created: Date.now() };
                 localStorage.setItem('slopsmith-chain-presets', JSON.stringify(presets));
+                if (!localStorage.getItem('slopsmith-default-preset-name')) {
+                    localStorage.setItem('slopsmith-default-preset-name', name);
+                }
                 wrapper.remove();
                 renderPresetList();
-                renderToneMappingUI();
+                renderToneAutomationTargets();
                 // Refresh floating panel if open
-                const floatPanel = document.getElementById('ae-tone-panel-float');
-                if (floatPanel) { floatPanel.remove(); toggleTonePanel(); }
+                if (document.getElementById('ae-tone-panel-float')) {
+                    closeTonePanel();
+                    void toggleTonePanel();
+                }
             };
 
             saveBtn.addEventListener('click', doSave);
@@ -541,6 +604,7 @@
         }
 
         setupAudioQualityControls();
+        setupToneAutomationSettingsEvents();
     }
 
     // ── Audio Quality (soundfont) ─────────────────────────────────────────────
@@ -677,14 +741,121 @@
 
     // ── Preset Management ──────────────────────────────────────────────────────
     function getPresets() {
-        return JSON.parse(localStorage.getItem('slopsmith-chain-presets') || '{}');
+        try {
+            return JSON.parse(localStorage.getItem('slopsmith-chain-presets') || '{}') || {};
+        } catch (e) {
+            return {};
+        }
     }
+
+    function getDefaultPresetName() {
+        return localStorage.getItem('slopsmith-default-preset-name') || '';
+    }
+
+    function setDefaultPresetName(name) {
+        if (!name) localStorage.removeItem('slopsmith-default-preset-name');
+        else localStorage.setItem('slopsmith-default-preset-name', name);
+    }
+
+    function ensureDefaultPresetName() {
+        const presets = getPresets();
+        const names = Object.keys(presets);
+        if (names.length === 0) {
+            setDefaultPresetName('');
+            return '';
+        }
+        const current = getDefaultPresetName();
+        if (current && presets[current]) return current;
+        const first = names[0];
+        setDefaultPresetName(first);
+        return first;
+    }
+
+    /** Older saved presets may omit `items`; iterating undefined throws and can crash the embedded UI. */
+    function getPresetItems(preset) {
+        const items = preset?.items;
+        return Array.isArray(items) ? items : [];
+    }
+
+    function markSongTransition(durationMs = 7000) {
+        const until = Date.now() + Math.max(1000, Number(durationMs) || 7000);
+        window._aeSongTransitionUntil = until;
+        return until;
+    }
+
+    function isSongTransitioning() {
+        return Date.now() < (window._aeSongTransitionUntil || 0);
+    }
+
+    window._aeMarkSongTransition = markSongTransition;
+
+    /** Replace the entire native chain with a saved preset blob. Always clears first so
+     *  the previous menu/player chain is fully torn down and sounds cannot stack. */
+    async function replaceChainWithPresetBlob(preset, logCtx = '') {
+        if (!preset?.nativePreset) return false;
+        try {
+            await api.clearChain();
+            await api.loadPreset(preset.nativePreset);
+            applyPresetGainLevels(preset);
+            await refreshChain();
+            saveChainState();
+            return true;
+        } catch (e) {
+            console.error('[audio-engine] replaceChainWithPresetBlob' + (logCtx ? ` (${logCtx})` : '') + ':', e);
+            return false;
+        }
+    }
+
+    async function loadDefaultPreset(reason = 'manual') {
+        if ((reason === 'player-exit' || reason === 'song-stop') && isSongTransitioning()) {
+            console.log('[audio-engine] Skipping default preset during song transition:', reason);
+            return false;
+        }
+        const presets = getPresets();
+        const defaultName = ensureDefaultPresetName();
+        if (!defaultName || !presets[defaultName]) return false;
+        const preset = presets[defaultName];
+        if (!(await replaceChainWithPresetBlob(preset, `default:${defaultName}`))) return false;
+        console.log('[audio-engine] Loaded default preset:', defaultName, 'reason:', reason);
+        if (reason === 'player-exit' || reason === 'song-stop') {
+            window._preloadedSongKey = null;
+            window._toneSwitcher = null;
+        }
+        return true;
+    }
+
+    window._aeLoadDefaultPreset = loadDefaultPreset;
+    window._aeReplaceChainWithPresetBlob = replaceChainWithPresetBlob;
+
+    /** Clears the native FX chain when a new song starts. Avoid calling getChainState right after
+     *  clearChain — some JUCE bridges crash on that sequence; persist empty chain locally instead. */
+    async function clearChainForNewSong() {
+        if (!api?.clearChain) return;
+        try {
+            await api.clearChain();
+        } catch (e) {
+            console.warn('[audio-engine] clearChain (native):', e);
+            return;
+        }
+        try {
+            localStorage.setItem('slopsmith-signal-chain', '[]');
+        } catch (e) {
+            console.warn('[audio-engine] persist empty chain:', e);
+        }
+        try {
+            await refreshChain();
+        } catch (e) {
+            console.warn('[audio-engine] refreshChain after clear:', e);
+        }
+    }
+    window._aeClearChainForNewSong = clearChainForNewSong;
 
     function renderPresetList() {
         const container = $('ae-preset-list');
         if (!container) return;
         const presets = getPresets();
         const names = Object.keys(presets);
+        const defaultPresetName = ensureDefaultPresetName();
         if (names.length === 0) {
             container.innerHTML = '<div class="text-xs text-slate-500 italic">No saved presets</div>';
             return;
@@ -694,25 +865,34 @@
             const div = document.createElement('div');
             div.className = 'flex items-center gap-2 p-2 rounded bg-slate-800/50 text-sm';
             div.innerHTML = `
-                <span class="flex-1 text-slate-300">${name}</span>
+                <span class="flex-1 text-slate-300">${name}${name === defaultPresetName ? ' <span class="text-xs text-slate-500">(default)</span>' : ''}</span>
                 <span class="text-xs text-slate-500">${presets[name].items.length} processors</span>
+                <button class="text-xs px-2 py-1 rounded ${name === defaultPresetName ? 'bg-blue-700/60 text-slate-300 cursor-not-allowed' : 'bg-blue-600/50 hover:bg-blue-500'}" data-preset="${name}" data-action="default" ${name === defaultPresetName ? 'disabled' : ''}>Default</button>
                 <button class="text-xs px-2 py-1 rounded bg-emerald-600/50 hover:bg-emerald-500" data-preset="${name}" data-action="load">Load</button>
                 <button class="text-xs px-2 py-1 rounded bg-red-600/50 hover:bg-red-500" data-preset="${name}" data-action="delete">Del</button>
             `;
+            div.querySelector('[data-action="default"]').addEventListener('click', () => {
+                setDefaultPresetName(name);
+                renderPresetList();
+            });
             div.querySelector('[data-action="load"]').addEventListener('click', async () => {
                 const p = getPresets()[name];
                 if (!p) return;
-                const result = await api.loadPreset(p.nativePreset);
-                console.log('[audio-engine] Preset loaded:', name, result);
-                await refreshChain();
-                saveChainState();
+                if (await replaceChainWithPresetBlob(p, `settings-load:${name}`)) {
+                    console.log('[audio-engine] Preset loaded:', name);
+                }
             });
             div.querySelector('[data-action="delete"]').addEventListener('click', () => {
                 const ps = getPresets();
                 delete ps[name];
                 localStorage.setItem('slopsmith-chain-presets', JSON.stringify(ps));
+                const deletedWasDefault = getDefaultPresetName() === name;
+                if (deletedWasDefault) {
+                    const nextNames = Object.keys(ps);
+                    setDefaultPresetName(nextNames.length > 0 ? nextNames[0] : '');
+                }
                 renderPresetList();
-                renderToneMappingUI();
+                renderToneAutomationTargets();
             });
             container.appendChild(div);
         }
@@ -722,33 +902,57 @@
     let toneSwitcher = null;
     let toneMonitorInterval = null;
     let autoSwitchEnabled = localStorage.getItem('slopsmith-tone-auto-switch') === 'true';
+    const originalToneNamesCache = {};
 
     class ToneSwitcher {
         constructor() {
             this.toneSlotMap = {};  // { toneName: [slotId, ...] }
+            this.tonePresetMap = {}; // { toneName: preset }
             this.activeTone = null;
         }
 
         async preloadForSong(toneChanges, toneBase, mappings) {
-            // Get unique tone names
-            const toneNames = new Set([toneBase]);
-            for (const tc of toneChanges) toneNames.add(tc.name);
+            const changes = Array.isArray(toneChanges) ? toneChanges : [];
+            const rawBase = String(toneBase || '').trim();
+            const toneNames = new Set();
+            if (rawBase) toneNames.add(rawBase);
+            for (const tc of changes) {
+                const n = String(tc?.name || '').trim();
+                if (n) toneNames.add(n);
+            }
+            let effectiveBase = rawBase;
+            if (!effectiveBase && changes.length > 0) {
+                const sorted = [...changes]
+                    .filter(tc => String(tc?.name || '').trim())
+                    .sort((a, b) => getToneChangeTime(a) - getToneChangeTime(b));
+                if (sorted.length) effectiveBase = String(sorted[0].name).trim();
+            }
+            if (!effectiveBase && toneNames.size > 0) {
+                effectiveBase = toneNames.values().next().value;
+            }
 
             const presets = getPresets();
             this.toneSlotMap = {};
+            this.tonePresetMap = {};
             this.activeTone = null;
 
             // Clear chain first
             await api.clearChain();
 
+            if (toneNames.size === 0) {
+                console.warn('[tone-switcher] preloadForSong: no valid tone names; chain cleared only');
+                await refreshChain();
+                return;
+            }
+
             for (const toneName of toneNames) {
-                const presetName = mappings[toneName] || mappings['$default'];
+                const presetName = resolveTonePresetName(mappings, toneName);
                 if (!presetName || !presets[presetName]) continue;
 
                 const preset = presets[presetName];
                 // Load each item individually and track slot IDs
                 const slotIds = [];
-                for (const item of preset.items) {
+                for (const item of getPresetItems(preset)) {
                     let slotId = -1;
                     if (item.type === 'NAM' && item.path) {
                         slotId = await api.loadNAMModel(item.path);
@@ -760,15 +964,18 @@
                     if (slotId >= 0) slotIds.push(slotId);
                 }
                 this.toneSlotMap[toneName] = slotIds;
+                this.tonePresetMap[toneName] = preset;
 
                 // Bypass everything except the initial tone
-                if (toneName !== toneBase) {
-                    const changes = slotIds.map(id => ({ slotId: id, bypassed: true }));
-                    if (changes.length > 0) await api.setMultiBypass(changes);
+                if (toneName !== effectiveBase) {
+                    const bypassChanges = slotIds.map(id => ({ slotId: id, bypassed: true }));
+                    if (bypassChanges.length > 0) await api.setMultiBypass(bypassChanges);
                 }
             }
 
-            this.activeTone = toneBase;
+            this.activeTone = effectiveBase;
+            const initialPreset = this.tonePresetMap[effectiveBase];
+            if (initialPreset) applyPresetGainLevels(initialPreset);
             await refreshChain();
             console.log('[tone-switcher] Preloaded tones:', Object.keys(this.toneSlotMap));
         }
@@ -789,85 +996,201 @@
 
             if (changes.length > 0) api.setMultiBypass(changes);
             this.activeTone = toneName;
+            const newPreset = this.tonePresetMap[toneName];
+            if (newPreset) applyPresetGainLevels(newPreset);
             console.log('[tone-switcher] Switched to:', toneName);
         }
 
         async teardown() {
             this.toneSlotMap = {};
+            this.tonePresetMap = {};
             this.activeTone = null;
         }
     }
 
+    function readToneMappingsStore() {
+        let raw = {};
+        try {
+            raw = JSON.parse(localStorage.getItem('slopsmith-tone-mappings') || '{}') || {};
+        } catch (e) {
+            raw = {};
+        }
+        if (typeof raw !== 'object' || Array.isArray(raw)) raw = {};
+        if (!raw.global || typeof raw.global !== 'object' || Array.isArray(raw.global)) raw.global = {};
+        if (!raw.songs || typeof raw.songs !== 'object' || Array.isArray(raw.songs)) raw.songs = {};
+        if (!raw.midiPC || typeof raw.midiPC !== 'object' || Array.isArray(raw.midiPC)) raw.midiPC = {};
+        return raw;
+    }
+
     function getToneMappings(songKey) {
-        const all = JSON.parse(localStorage.getItem('slopsmith-tone-mappings') || '{"global":{},"songs":{}}');
+        const all = readToneMappingsStore();
         const songMappings = songKey ? (all.songs[songKey] || {}) : {};
         return { ...all.global, ...songMappings };
     }
 
     function saveToneMappings(songKey, mappings) {
-        const all = JSON.parse(localStorage.getItem('slopsmith-tone-mappings') || '{"global":{},"songs":{}}');
+        const all = readToneMappingsStore();
         if (songKey) {
-            all.songs[songKey] = mappings;
+            all.songs[songKey] = mappings || {};
         } else {
-            all.global = mappings;
+            all.global = mappings || {};
         }
         localStorage.setItem('slopsmith-tone-mappings', JSON.stringify(all));
     }
 
     function getMidiPCConfig(songKey) {
-        const all = JSON.parse(localStorage.getItem('slopsmith-tone-mappings') || '{}');
+        const all = readToneMappingsStore();
         return all.midiPC?.[songKey] || null;
     }
 
     function saveMidiPCConfig(songKey, config) {
-        const all = JSON.parse(localStorage.getItem('slopsmith-tone-mappings') || '{}');
-        if (!all.midiPC) all.midiPC = {};
-        all.midiPC[songKey] = config;
+        const all = readToneMappingsStore();
+        if (config == null) delete all.midiPC[songKey];
+        else all.midiPC[songKey] = config;
         localStorage.setItem('slopsmith-tone-mappings', JSON.stringify(all));
     }
 
-    function renderToneMappingUI() {
-        const container = $('ae-tone-mappings');
-        const section = $('ae-tone-switching');
-        if (!container || !section) return;
+    function normalizeSongKey(raw) {
+        return String(raw || '')
+            .replace(/\\/g, '/')
+            .trim();
+    }
 
-        // Get tone data from highway
-        const hw = window.highway || window._slopsmithHighway;
-        if (!hw) { section.classList.add('hidden'); return; }
-
-        const toneChanges = hw.getToneChanges ? hw.getToneChanges() : [];
-        const toneBase = hw.getToneBase ? hw.getToneBase() : '';
-        if (toneChanges.length === 0 && !toneBase) { section.classList.add('hidden'); return; }
-
-        section.classList.remove('hidden');
-        const toneNames = new Set([toneBase]);
-        for (const tc of toneChanges) toneNames.add(tc.name);
-
-        const presets = getPresets();
-        const presetNames = Object.keys(presets);
-        const songKey = window._currentSongFile || document.title || '';
-        const mappings = getToneMappings(songKey);
-
-        container.innerHTML = '';
-        for (const tone of toneNames) {
-            if (!tone) continue;
-            const div = document.createElement('div');
-            div.className = 'flex items-center gap-2 mb-1';
-            div.innerHTML = `
-                <span class="text-xs text-slate-400 w-24 truncate" title="${tone}">${tone}</span>
-                <select class="flex-1 bg-slate-700 border border-slate-600 rounded px-2 py-1 text-xs text-slate-300" data-tone="${tone}">
-                    <option value="">-- none --</option>
-                    ${presetNames.map(p => `<option value="${p}" ${mappings[tone] === p ? 'selected' : ''}>${p}</option>`).join('')}
-                </select>
-            `;
-            div.querySelector('select').addEventListener('change', (e) => {
-                const m = getToneMappings(songKey);
-                if (e.target.value) m[tone] = e.target.value;
-                else delete m[tone];
-                saveToneMappings(songKey, m);
-            });
-            container.appendChild(div);
+    function getCurrentSongKey() {
+        const current = normalizeSongKey(window._currentSongFile);
+        if (current) {
+            window._slopsmithSongKey = current;
+            return current;
         }
+        return normalizeSongKey(window._slopsmithSongKey || document.title || '');
+    }
+
+    function getToneChangeTime(tc) {
+        const t = tc?.t ?? tc?.time ?? tc?.timestamp ?? tc?.at;
+        return Number.isFinite(t) ? t : Infinity;
+    }
+
+    function _toneMatchKey(value) {
+        return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    }
+
+    function findMappingForTone(mappings, toneName) {
+        if (!mappings || typeof mappings !== 'object') return null;
+        if (mappings[toneName]) return mappings[toneName];
+        const target = _toneMatchKey(toneName);
+        if (!target) return null;
+        for (const key of Object.keys(mappings)) {
+            if (key === '$default') continue;
+            const k = _toneMatchKey(key);
+            if (!k) continue;
+            if (k === target || k.includes(target) || target.includes(k)) {
+                return mappings[key];
+            }
+        }
+        return null;
+    }
+
+    /** Chain preset name for a tone: explicit/fuzzy mapping → tone-mapping `$default` → app default preset (-- none --). */
+    function resolveTonePresetName(mappings, toneName) {
+        if (!mappings || typeof mappings !== 'object') mappings = {};
+        const mapped = findMappingForTone(mappings, toneName);
+        if (mapped) return mapped;
+        if (mappings['$default']) return mappings['$default'];
+        const fallback = ensureDefaultPresetName();
+        return fallback || null;
+    }
+
+    window._aeFindMappingForTone = findMappingForTone;
+    window._aeResolveTonePresetName = resolveTonePresetName;
+
+    async function getOriginalToneNamesForCurrentArrangement(songKey) {
+        const key = normalizeSongKey(songKey);
+        if (!key) return [];
+        try {
+            const resp = await fetch(`/api/plugins/midi_amp/song-tones/${encodeURIComponent(key)}`);
+            if (!resp.ok) return [];
+            const data = await resp.json();
+            const tones = Array.isArray(data?.tones) ? data.tones : [];
+            const arr = String(window.slopsmith?.currentSong?.arrangement || '').trim().toLowerCase();
+            const filtered = arr
+                ? tones.filter(t => String(t?.arrangement || '').trim().toLowerCase() === arr)
+                : tones;
+            return Array.from(new Set(filtered.map(t => (t?.name || t?.key || '').trim()).filter(Boolean)));
+        } catch (e) {
+            return [];
+        }
+    }
+
+    function getCurrentArrangementName() {
+        return String(window.slopsmith?.currentSong?.arrangement || '').trim();
+    }
+
+    async function getOriginalToneNames(songKey, arrangementName = '') {
+        const key = normalizeSongKey(songKey);
+        const arr = String(arrangementName || '').trim().toLowerCase();
+        if (!key) return [];
+        const cacheKey = `${key}::${arr}::v2`;
+        if (originalToneNamesCache[cacheKey]) return originalToneNamesCache[cacheKey];
+        try {
+            const resp = await fetch(`/api/plugins/midi_amp/song-tones/${encodeURIComponent(key)}`);
+            if (!resp.ok) return [];
+            const data = await resp.json();
+            const tones = Array.isArray(data?.tones) ? data.tones : [];
+            const filtered = arr
+                ? tones.filter(t => String(t?.arrangement || '').trim().toLowerCase() === arr)
+                : tones;
+            const names = filtered
+                .map(t => (t?.name || t?.key || '').trim())
+                .filter(Boolean);
+            // When an arrangement is set, never mix in tones from other tracks (e.g. Bass vs Rhythm).
+            const finalNames = arr
+                ? names
+                : (names.length > 0
+                    ? names
+                    : tones.map(t => (t?.name || t?.key || '').trim()).filter(Boolean));
+            originalToneNamesCache[cacheKey] = Array.from(new Set(finalNames));
+            return originalToneNamesCache[cacheKey];
+        } catch (e) {
+            return [];
+        }
+    }
+
+    async function normalizeTimelineToneData(songKey, toneChanges, toneBase, arrangementName = '') {
+        const originalNames = await getOriginalToneNames(songKey, arrangementName);
+        if (originalNames.length === 0) {
+            return {
+                toneChanges: Array.isArray(toneChanges) ? toneChanges : [],
+                toneBase: toneBase || '',
+                originalNames,
+            };
+        }
+        const toneKey = (v) => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        const keys = originalNames.map(toneKey).filter(Boolean);
+        const matchesOriginal = (name) => {
+            const k = toneKey(name);
+            if (!k) return false;
+            return keys.some(ok => ok === k || ok.includes(k) || k.includes(ok));
+        };
+        const baseOk = !!toneBase && matchesOriginal(toneBase);
+        const changes = Array.isArray(toneChanges) ? toneChanges : [];
+        const hasMatchingChange = changes.some(tc => {
+            const name = String(tc?.name || '');
+            return matchesOriginal(name);
+        });
+        if (baseOk || hasMatchingChange) {
+            return { toneChanges: changes, toneBase: toneBase || '', originalNames };
+        }
+        // No overlap with active arrangement tones: treat timeline data as stale.
+        return { toneChanges: [], toneBase: '', originalNames };
+    }
+
+    function escHtml(value) {
+        return String(value ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
     }
 
     function startToneMonitor() {
@@ -880,13 +1203,111 @@
             const changes = hw.getToneChanges ? hw.getToneChanges() : [];
             const base = hw.getToneBase ? hw.getToneBase() : '';
 
-            let activeTone = base;
+            let activeTone = String(base || '').trim();
             for (const tc of changes) {
-                if (tc.t <= t) activeTone = tc.name;
-                else break;
+                if (getToneChangeTime(tc) <= t) {
+                    const n = String(tc?.name || '').trim();
+                    if (n) activeTone = n;
+                } else break;
             }
             if (activeTone) toneSwitcher.switchToTone(activeTone);
         }, 50);
+    }
+
+    function getActiveToneAtTime(timeSec, toneChanges, toneBase) {
+        let activeTone = String(toneBase || '').trim();
+        for (const tc of toneChanges) {
+            if (getToneChangeTime(tc) <= timeSec) {
+                const n = String(tc?.name || '').trim();
+                if (n) activeTone = n;
+            } else break;
+        }
+        return activeTone;
+    }
+
+    let _applyToneMappingsLock = Promise.resolve();
+    function applyToneMappingsNow(songKey, options = {}) {
+        const next = _applyToneMappingsLock
+            .catch(() => {})
+            .then(() => _applyToneMappingsImpl(songKey, options));
+        _applyToneMappingsLock = next.catch(() => {});
+        return next;
+    }
+
+    async function _applyToneMappingsImpl(songKey, options = {}) {
+        const forceBypass = !!options.forceBypass;
+        const changedTone = String(options.changedTone || '').trim();
+        const hw = window.highway || window._slopsmithHighway;
+        if (!hw) return;
+
+        // Tone Automation overrides manual tone mappings: it owns the chain
+        // while enabled and reacts to song/tone events through its own switcher.
+        if (!options.force && window._aeToneAutomation?.isEnabled?.()) {
+            const rawToneChanges = hw.getToneChanges ? hw.getToneChanges() : [];
+            const rawToneBase = hw.getToneBase ? hw.getToneBase() : '';
+            await installTaSwitcherForSong(songKey, rawToneChanges, rawToneBase);
+            return;
+        }
+
+        const rawToneChanges = hw.getToneChanges ? hw.getToneChanges() : [];
+        const rawToneBase = hw.getToneBase ? hw.getToneBase() : '';
+        const arrangementName = getCurrentArrangementName();
+        const normalized = await normalizeTimelineToneData(songKey, rawToneChanges, rawToneBase, arrangementName);
+        const toneChanges = normalized.toneChanges;
+        const toneBase = normalized.toneBase;
+        const mappings = getToneMappings(songKey);
+        if (Object.keys(mappings).length === 0) return;
+        if (toneChanges.length === 0 && !toneBase) {
+            // Songs without tone automation: apply the selected tone mapping directly.
+            const arrangementToneNames = normalized.originalNames.length > 0
+                ? normalized.originalNames
+                : await getOriginalToneNames(songKey, arrangementName);
+            const targetTone =
+                changedTone ||
+                arrangementToneNames.find(n => !!findMappingForTone(mappings, n)) ||
+                Object.keys(mappings).filter(k => k !== '$default')[0] ||
+                '';
+            const presetName = resolveTonePresetName(mappings, targetTone);
+            const presets = getPresets();
+            const preset = presetName ? presets[presetName] : null;
+            if (preset?.nativePreset) {
+                await replaceChainWithPresetBlob(preset, `tone-map:${songKey}`);
+            } else {
+                await loadDefaultPreset('tone-none');
+            }
+            return;
+        }
+
+        const currentTime = hw.getTime ? hw.getTime() : 0;
+        const activeNow = getActiveToneAtTime(currentTime, toneChanges, toneBase);
+
+        if (!forceBypass) {
+            const midiConfig = getMidiPCConfig(songKey);
+            if (midiConfig?.mode === 'midi' && midiConfig.vstSlotId >= 0) {
+                const midiMappings = midiConfig.mappings || {};
+                toneSwitcher = null;
+                window._toneSwitcher = {
+                    activeTone: null,
+                    midiMode: true,
+                    switchToTone(name) {
+                        if (name === this.activeTone) return;
+                        const program = midiMappings[name];
+                        if (program !== undefined && api?.sendMidiToSlot) {
+                            api.sendMidiToSlot(midiConfig.vstSlotId, 0, midiConfig.channel || 1, program);
+                        }
+                        this.activeTone = name;
+                    }
+                };
+                if (activeNow) window._toneSwitcher.switchToTone(activeNow);
+                return;
+            }
+        }
+
+        toneSwitcher = new ToneSwitcher();
+        window._toneSwitcher = toneSwitcher;
+        await toneSwitcher.preloadForSong(toneChanges, toneBase, mappings);
+        if (activeNow) toneSwitcher.switchToTone(activeNow);
+        if (autoSwitchEnabled) startToneMonitor();
     }
 
     function stopToneMonitor() {
@@ -900,6 +1321,13 @@
 
         // Add button before the close button
         const closeBtn = controls.querySelector('button[onclick*="showScreen"]');
+        if (closeBtn && !closeBtn.dataset.chainPanelCloseBound) {
+            closeBtn.addEventListener('click', () => {
+                closeTonePanel();
+                void loadDefaultPreset('player-exit');
+            }, { capture: true });
+            closeBtn.dataset.chainPanelCloseBound = '1';
+        }
         const btn = document.createElement('button');
         btn.id = 'btn-chain-switch';
         btn.className = 'px-3 py-1.5 bg-orange-900/40 hover:bg-orange-900/60 rounded-lg text-xs text-orange-300 transition';
@@ -910,9 +1338,26 @@
     }
 
     window._toggleChainPanel = toggleTonePanel;
+    function closeTonePanel() {
+        const panel = document.getElementById('ae-tone-panel-float');
+        if (panel?._aeActiveToneInterval) {
+            clearInterval(panel._aeActiveToneInterval);
+            panel._aeActiveToneInterval = null;
+        }
+        if (panel) panel.remove();
+    }
+    window._closeChainPanel = closeTonePanel;
+    async function refreshTonePanelIfOpen() {
+        const panel = document.getElementById('ae-tone-panel-float');
+        if (!panel) return;
+        closeTonePanel();
+        await toggleTonePanel();
+    }
+    window._refreshChainPanel = refreshTonePanelIfOpen;
+
     async function toggleTonePanel() {
         let panel = document.getElementById('ae-tone-panel-float');
-        if (panel) { panel.remove(); return; }
+        if (panel) { closeTonePanel(); return; }
 
         const player = document.getElementById('player');
         if (!player) return;
@@ -924,137 +1369,361 @@
         panel.className = 'bg-slate-900 border border-slate-700 rounded-xl p-4 shadow-2xl';
         panel.innerHTML = `<div class="flex items-center justify-between mb-3">
             <span class="text-sm font-semibold text-slate-200">Tone Switching</span>
-            <button onclick="document.getElementById('ae-tone-panel-float').remove()" class="text-slate-500 hover:text-white text-lg leading-none">&times;</button>
+            <button type="button" onclick="window._closeChainPanel && window._closeChainPanel()" class="text-slate-500 hover:text-white text-lg leading-none">&times;</button>
         </div><div class="text-xs text-slate-400 animate-pulse">Loading...</div>`;
         player.style.position = 'relative';
         player.appendChild(panel);
 
-        const hw = window.highway || window._slopsmithHighway;
-        const toneChanges = hw?.getToneChanges ? hw.getToneChanges() : [];
-        const toneBase = hw?.getToneBase ? hw.getToneBase() : '';
-        const presets = getPresets();
-        const presetNames = Object.keys(presets);
-        const songKey = window._currentSongFile || document.title || '';
-        const mappings = getToneMappings(songKey);
-        const midiConfig = getMidiPCConfig(songKey);
-        const isMidiMode = midiConfig?.mode === 'midi';
+        let toneChanges = [];
+        let toneBase = '';
+        let presets = {};
+        let presetNames = [];
+        let songKey = '';
+        let mappings = {};
+        let midiConfig = null;
+        let isMidiMode = false;
+        const toneNamesOrdered = [];
+        const addToneUnique = (name) => {
+            const n = String(name || '').trim();
+            if (!n || toneNamesOrdered.includes(n)) return;
+            toneNamesOrdered.push(n);
+        };
 
-        const toneNames = new Set();
-        if (toneBase) toneNames.add(toneBase);
-        for (const tc of toneChanges) toneNames.add(tc.name);
-
-        // Get VST slots for MIDI mode dropdown (this is the slow part)
-        const apiLocal = window.slopsmithDesktop?.audio;
-        let vstSlots = [];
-        if (apiLocal) {
+        try {
+            const hw = window.highway || window._slopsmithHighway;
             try {
-                const chain = await apiLocal.getChainState();
-                vstSlots = chain.filter(s => s.type === 0);
-            } catch(e) {}
+                toneChanges = hw?.getToneChanges ? hw.getToneChanges() : [];
+            } catch (e) {
+                console.warn('[audio-engine] getToneChanges failed:', e);
+            }
+            let rawToneBaseFromHw = '';
+            try {
+                toneBase = hw?.getToneBase ? hw.getToneBase() : '';
+                rawToneBaseFromHw = toneBase;
+            } catch (e) {
+                console.warn('[audio-engine] getToneBase failed:', e);
+            }
+            try {
+                presets = getPresets();
+            } catch (e) {
+                console.warn('[audio-engine] slopsmith-chain-presets JSON invalid, using {}:', e);
+                presets = {};
+            }
+            presetNames = Object.keys(presets);
+            songKey = getCurrentSongKey();
+            try {
+                mappings = getToneMappings(songKey);
+            } catch (e) {
+                console.warn('[audio-engine] tone mappings JSON invalid:', e);
+                mappings = {};
+            }
+            try {
+                midiConfig = getMidiPCConfig(songKey);
+            } catch (e) {
+                console.warn('[audio-engine] MIDI PC config read failed:', e);
+                midiConfig = null;
+            }
+            isMidiMode = midiConfig?.mode === 'midi';
+
+            const arrangementName = getCurrentArrangementName();
+            const normalized = await normalizeTimelineToneData(songKey, toneChanges, toneBase, arrangementName);
+            toneChanges = normalized.toneChanges;
+            toneBase = normalized.toneBase;
+            toneNamesOrdered.length = 0;
+            // Timeline has only a base tone (no tone_changes): show one row — do not list tones from other arrangements.
+            if (toneChanges.length === 0 && (toneBase || rawToneBaseFromHw)) {
+                addToneUnique(toneBase || rawToneBaseFromHw);
+            } else {
+                if (toneBase) addToneUnique(toneBase);
+                for (const tc of toneChanges) {
+                    if (tc && tc.name) addToneUnique(tc.name);
+                }
+                if (toneNamesOrdered.length === 0) {
+                    for (const n of normalized.originalNames) addToneUnique(n);
+                }
+            }
+        } catch (err) {
+            console.error('[audio-engine] Failed to read tone / preset data:', err);
+            const stillThere = document.getElementById('ae-tone-panel-float');
+            if (stillThere) {
+                stillThere.innerHTML = `<div class="flex items-center justify-between mb-3">
+                    <span class="text-sm font-semibold text-slate-200">Tone Switching</span>
+                    <button type="button" onclick="window._closeChainPanel && window._closeChainPanel()" class="text-slate-500 hover:text-white text-lg leading-none">&times;</button>
+                </div>
+                <div class="text-xs text-red-400">Failed to load: ${(err && err.message) || 'unknown error'}</div>`;
+            }
+            return;
         }
 
-        // Check if panel was closed while loading
         if (!document.getElementById('ae-tone-panel-float')) return;
+
+        try {
+
+        // VST list is filled after first paint. Calling getChainState() before
+        // innerHTML can freeze the UI forever if the native bridge blocks the JS
+        // thread synchronously (timers then never run).
+        const midiMappings = midiConfig?.mappings || {};
+        const taCfg = readTaStore();
+        /** Which switching UI is active: automation wins over MIDI when enabled in settings. */
+        const panelMode = taCfg.enabled ? 'automation' : (isMidiMode ? 'midi' : 'bypass');
 
         let html = `<div class="flex items-center justify-between mb-3">
             <span class="text-sm font-semibold text-slate-200">Tone Switching</span>
-            <button onclick="document.getElementById('ae-tone-panel-float').remove()" class="text-slate-500 hover:text-white text-lg leading-none">&times;</button>
+            <button type="button" onclick="window._closeChainPanel && window._closeChainPanel()" class="text-slate-500 hover:text-white text-lg leading-none">&times;</button>
         </div>`;
 
-        if (toneNames.size === 0) {
-            html += '<div class="text-xs text-slate-500 italic">No tone changes in this song</div>';
-        } else {
-            // Mode selector
-            html += `<div class="flex items-center gap-2 mb-3">
-                <label class="text-xs text-slate-400">Mode:</label>
-                <select id="ae-tone-mode" class="bg-slate-700 border border-slate-600 rounded px-2 py-1 text-xs text-slate-300">
-                    <option value="bypass" ${!isMidiMode ? 'selected' : ''}>Preset Switch</option>
-                    <option value="midi" ${isMidiMode ? 'selected' : ''}>MIDI Program Change</option>
-                </select>
-            </div>`;
+        if (toneNamesOrdered.length === 0) {
+            const arrangementName = getCurrentArrangementName();
+            const originalNames = await getOriginalToneNames(songKey, arrangementName);
+            for (const n of originalNames) addToneUnique(n);
+        }
 
-            // Bypass mode (existing)
-            html += `<div id="ae-bypass-mode" class="${isMidiMode ? 'hidden' : ''}">`;
+        // Mode selector — Preset Switch | MIDI PC | Tone Automation (keyword routing from settings)
+        html += `<div class="flex items-center gap-2 mb-3">
+            <label class="text-xs text-slate-400">Mode:</label>
+            <select id="ae-tone-mode" class="flex-1 bg-slate-700 border border-slate-600 rounded px-2 py-1 text-xs text-slate-300">
+                <option value="bypass" ${panelMode === 'bypass' ? 'selected' : ''}>Preset Switch</option>
+                <option value="midi" ${panelMode === 'midi' ? 'selected' : ''}>MIDI Program Change</option>
+                <option value="automation" ${panelMode === 'automation' ? 'selected' : ''}>Tone Automation</option>
+            </select>
+        </div>`;
+
+        if (toneNamesOrdered.length > 0) {
+
+            // Bypass mode — manual preset mapping per tone name
+            html += `<div id="ae-bypass-mode" class="${panelMode === 'bypass' ? '' : 'hidden'}">`;
             html += '<div class="space-y-2 mb-3">';
-            for (const tone of toneNames) {
+            for (const tone of toneNamesOrdered) {
                 if (!tone) continue;
+                const mappedPreset = findMappingForTone(mappings, tone) || mappings[tone] || null;
                 html += `<div class="flex items-center gap-2">
-                    <span class="text-xs text-slate-400 w-24 truncate" title="${tone}">${tone}</span>
-                    <select class="flex-1 bg-slate-700 border border-slate-600 rounded px-2 py-1 text-xs text-slate-300" data-tone="${tone}">
+                    <span class="text-xs text-slate-400 w-24 truncate" title="${escHtml(tone)}">${escHtml(tone)}</span>
+                    <select class="flex-1 bg-slate-700 border border-slate-600 rounded px-2 py-1 text-xs text-slate-300" data-tone="${escHtml(tone)}">
                         <option value="">-- none --</option>
-                        ${presetNames.map(p => `<option value="${p}" ${mappings[tone] === p ? 'selected' : ''}>${p}</option>`).join('')}
+                        ${presetNames.map(p => `<option value="${escHtml(p)}" ${mappedPreset === p ? 'selected' : ''}>${escHtml(p)}</option>`).join('')}
                     </select>
                 </div>`;
             }
             html += '</div></div>';
 
-            // MIDI PC mode (new)
-            const midiMappings = midiConfig?.mappings || {};
-            html += `<div id="ae-midi-mode" class="${!isMidiMode ? 'hidden' : ''}">`;
-            if (vstSlots.length === 0) {
-                html += '<div class="text-xs text-slate-500 italic mb-2">No VST plugins loaded. Load a VST first.</div>';
-            } else {
-                html += `<div class="space-y-2 mb-3">
-                    <div class="flex items-center gap-2">
-                        <span class="text-xs text-slate-400 w-20">VST:</span>
-                        <select id="ae-midi-vst" class="flex-1 bg-slate-700 border border-slate-600 rounded px-2 py-1 text-xs text-slate-300">
-                            ${vstSlots.map(s => `<option value="${s.id}" ${midiConfig?.vstSlotId === s.id ? 'selected' : ''}>${s.name}</option>`).join('')}
-                        </select>
-                    </div>
-                    <div class="flex items-center gap-2">
-                        <span class="text-xs text-slate-400 w-20">Channel:</span>
-                        <input type="number" id="ae-midi-ch" min="1" max="16" value="${midiConfig?.channel || 1}" class="w-16 bg-slate-700 border border-slate-600 rounded px-2 py-1 text-xs text-slate-300">
-                    </div>
+            // Tone Automation — classifier defaults + optional session-only overrides (see *)
+            html += `<div id="ae-automation-mode" class="${panelMode === 'automation' ? '' : 'hidden'}">`;
+            html += `<p class="text-[11px] text-slate-500 mb-2 leading-snug">Targets from keywords (configure in audio settings). You may override presets per tone for this play only; <span class="text-slate-400">*</span> means different from automation. Closing the song resets overrides.</p>`;
+            html += '<div class="space-y-2 mb-3">';
+            for (const tone of toneNamesOrdered) {
+                if (!tone) continue;
+                const eff = getTaSessionEffectivePreset(tone, taCfg);
+                const effPreset = eff.effectiveName || '';
+                const catUpper = String(eff.category || '').toUpperCase();
+                html += `<div class="flex items-center gap-2">
+                    <span class="text-xs text-slate-400 w-24 truncate" title="${escHtml(tone)}">${escHtml(tone)}</span>
+                    <select data-ta-override-tone="${escHtml(tone)}" class="flex-1 bg-slate-700 border border-slate-600 rounded px-2 py-1 text-xs text-slate-300">
+                        <option value="">-- none --</option>
+                        ${presetNames.map(p => `<option value="${escHtml(p)}" ${effPreset === p ? 'selected' : ''}>${escHtml(p)}</option>`).join('')}
+                    </select>
+                    <span data-ta-override-star class="text-amber-400 w-4 shrink-0 text-center text-sm font-bold leading-none" title="Preset differs from automation (this session only)">${eff.showStar ? '*' : ''}</span>
+                    <span class="text-[10px] text-emerald-400/90 w-11 shrink-0 text-right font-medium" title="Classifier bucket">${escHtml(catUpper)}</span>
                 </div>`;
-                html += '<div class="space-y-1 mb-3">';
-                for (const tone of toneNames) {
-                    if (!tone) continue;
-                    html += `<div class="flex items-center gap-2">
-                        <span class="text-xs text-slate-400 w-24 truncate" title="${tone}">${tone}</span>
-                        <input type="number" min="0" max="127" value="${midiMappings[tone] ?? ''}" placeholder="PC#"
-                            data-midi-tone="${tone}" class="w-16 bg-slate-700 border border-slate-600 rounded px-2 py-1 text-xs text-slate-300">
-                    </div>`;
-                }
-                html += '</div>';
-                html += `<button id="ae-midi-save" class="px-3 py-1.5 rounded bg-emerald-600/50 hover:bg-emerald-500 text-xs text-slate-200">Save MIDI Mapping</button>`;
+            }
+            html += '</div></div>';
+
+            // MIDI PC mode — VST dropdown is filled after first paint (see hydrateChainVstOptions)
+            html += `<div id="ae-midi-mode" class="${panelMode === 'midi' ? '' : 'hidden'}">`;
+            html += `<div class="space-y-2 mb-3">
+                <div class="flex items-center gap-2">
+                    <span class="text-xs text-slate-400 w-20">VST:</span>
+                    <select id="ae-midi-vst" class="flex-1 bg-slate-700 border border-slate-600 rounded px-2 py-1 text-xs text-slate-300">
+                        <option value="">Loading plug-in list…</option>
+                    </select>
+                </div>
+                <div class="flex items-center gap-2">
+                    <span class="text-xs text-slate-400 w-20">Channel:</span>
+                    <input type="number" id="ae-midi-ch" min="1" max="16" value="${midiConfig?.channel || 1}" class="w-16 bg-slate-700 border border-slate-600 rounded px-2 py-1 text-xs text-slate-300">
+                </div>
+            </div>`;
+            html += '<div id="ae-midi-vst-hint" class="text-xs text-slate-500 mb-2"></div>';
+            html += '<div class="space-y-1 mb-3">';
+            for (const tone of toneNamesOrdered) {
+                if (!tone) continue;
+                html += `<div class="flex items-center gap-2">
+                    <span class="text-xs text-slate-400 w-24 truncate" title="${escHtml(tone)}">${escHtml(tone)}</span>
+                    <input type="number" min="0" max="127" value="${midiMappings[tone] ?? ''}" placeholder="PC#"
+                        data-midi-tone="${escHtml(tone)}" class="w-16 bg-slate-700 border border-slate-600 rounded px-2 py-1 text-xs text-slate-300">
+                </div>`;
             }
             html += '</div>';
+            html += `<button id="ae-midi-save" class="px-3 py-1.5 rounded bg-emerald-600/50 hover:bg-emerald-500 text-xs text-slate-200">Save MIDI Mapping</button>`;
+            html += '</div>';
+        } else {
+            // Keep mode-section ids so the Mode dropdown can show/hide bodies even
+            // when this arrangement exposes no tone rows yet.
+            html += `<div id="ae-bypass-mode" class="${panelMode === 'bypass' ? '' : 'hidden'}"><p class="text-xs text-slate-500 italic">No tone information found for this song.</p></div>`;
+            html += `<div id="ae-automation-mode" class="${panelMode === 'automation' ? '' : 'hidden'}"><p class="text-xs text-slate-500 italic mb-1">No tone names listed for this arrangement.</p><p class="text-[11px] text-slate-600">Automation still classifies from the song title when you play.</p></div>`;
+            html += `<div id="ae-midi-mode" class="${panelMode === 'midi' ? '' : 'hidden'}"><p class="text-xs text-slate-500 italic">No tones to assign MIDI program numbers.</p></div>`;
         }
 
         html += `<label class="flex items-center gap-2 text-xs text-slate-400 cursor-pointer mb-2 mt-2">
             <input type="checkbox" class="accent-blue-500" id="ae-float-auto-switch" ${autoSwitchEnabled ? 'checked' : ''}>
             Auto-switch during playback
         </label>`;
-        html += `<div class="text-xs text-slate-600" id="ae-active-tone"></div>`;
+        html += `<div class="mt-3 pt-2 border-t border-slate-700/60">
+            <div class="text-[10px] uppercase tracking-wider text-slate-500 font-semibold mb-1">Active Indicator</div>
+            <div class="text-xs text-slate-300 font-medium min-h-[1rem]" id="ae-active-tone">Active: —</div>
+        </div>`;
 
         panel.innerHTML = html;
         player.style.position = 'relative';
         player.appendChild(panel);
 
+        // Active indicator — shows the live tone state resolved through whichever
+        // engine is currently driving `_toneSwitcher` (Tone Automation, manual
+        // bypass mappings, or MIDI PC). When a preset is known, it's rendered as
+        // `tone → preset` so users can verify their classification visually.
+        const updateActiveToneLabel = () => {
+            const el = document.getElementById('ae-active-tone');
+            if (!el) return;
+            const hw = window.highway || window._slopsmithHighway;
+            const switcher = window._toneSwitcher;
+            const taOn = !!window._aeToneAutomation?.isEnabled?.();
+
+            const tNum = (hw && typeof hw.getTime === 'function') ? hw.getTime() : 0;
+            const changes = (hw && hw.getToneChanges) ? hw.getToneChanges() : [];
+            const base = (hw && hw.getToneBase) ? hw.getToneBase() : '';
+            const timelineTone = getActiveToneAtTime(tNum, changes, base);
+            const switcherTone = String(switcher?.activeTone || '').trim();
+            const activeTone = switcherTone || timelineTone || '';
+
+            let presetName = '';
+            if (switcher) {
+                if (switcher.activePreset) {
+                    presetName = String(switcher.activePreset);
+                } else if (switcher.tonePresetMap && activeTone && switcher.tonePresetMap[activeTone]) {
+                    const p = switcher.tonePresetMap[activeTone];
+                    if (p && typeof p === 'object') {
+                        const presets = getPresets();
+                        for (const [name, entry] of Object.entries(presets)) {
+                            if (entry === p) { presetName = name; break; }
+                        }
+                    }
+                }
+            }
+            if (!presetName && taOn && activeTone) {
+                const eff = getTaSessionEffectivePreset(activeTone, readTaStore());
+                if (eff.effectiveName) presetName = eff.effectiveName;
+            }
+
+            const prefix = taOn ? 'Active (TA):' : 'Active:';
+            if (activeTone && presetName) {
+                el.innerHTML = `<span class="text-slate-500">${prefix}</span> <span>${escHtml(activeTone)}</span> <span class="text-slate-500">→</span> <span class="text-blue-300">${escHtml(presetName)}</span>`;
+            } else if (activeTone) {
+                el.innerHTML = `<span class="text-slate-500">${prefix}</span> <span>${escHtml(activeTone)}</span>`;
+            } else if (presetName) {
+                el.innerHTML = `<span class="text-slate-500">${prefix}</span> <span class="text-blue-300">${escHtml(presetName)}</span>`;
+            } else {
+                el.innerHTML = `<span class="text-slate-500">${prefix}</span> <span class="text-slate-500">—</span>`;
+            }
+        };
+        updateActiveToneLabel();
+        panel._aeActiveToneInterval = setInterval(updateActiveToneLabel, 200);
+
         // Wire up select changes
         panel.querySelectorAll('select[data-tone]').forEach(sel => {
-            sel.addEventListener('change', (e) => {
+            sel.addEventListener('change', async (e) => {
                 const m = getToneMappings(songKey);
                 if (e.target.value) m[e.target.dataset.tone] = e.target.value;
                 else delete m[e.target.dataset.tone];
                 saveToneMappings(songKey, m);
+                // Force bypass preloader to rebuild mapping during current playback
+                window._preloadedSongKey = null;
+                try {
+                    await applyToneMappingsNow(songKey, { forceBypass: true, changedTone: e.target.dataset.tone });
+                } catch (err) {
+                    console.error('[tone-switcher] Failed to apply mapping live:', err);
+                }
             });
         });
 
-        // Wire mode toggle
+        panel.querySelectorAll('select[data-ta-override-tone]').forEach(sel => {
+            sel.addEventListener('change', async (e) => {
+                const tone = e.target.dataset.taOverrideTone;
+                const val = e.target.value;
+                const cfg = readTaStore();
+                const { presetName: autoP } = resolveTaPreset(tone, cfg);
+                window._aeTaSessionOverrides = window._aeTaSessionOverrides || {};
+                if (!val || val === autoP) delete window._aeTaSessionOverrides[tone];
+                else window._aeTaSessionOverrides[tone] = val;
+
+                const starEl = e.target.parentElement?.querySelector('[data-ta-override-star]');
+                if (starEl) {
+                    const eff = getTaSessionEffectivePreset(tone, readTaStore());
+                    starEl.textContent = eff.showStar ? '*' : '';
+                }
+
+                const switcher = window._toneSwitcher;
+                if (!switcher?.taSwitcher) return;
+                const hw = window.highway || window._slopsmithHighway;
+                const tNum = hw?.getTime ? hw.getTime() : 0;
+                const changes = hw?.getToneChanges ? hw.getToneChanges() : [];
+                const base = hw?.getToneBase ? hw.getToneBase() : '';
+                const timelineTone = getActiveToneAtTime(tNum, changes, base);
+                const switcherTone = String(switcher.activeTone || '').trim();
+                const activeToneNow = switcherTone || timelineTone || '';
+                if (String(activeToneNow) !== String(tone)) return;
+
+                const eff = getTaSessionEffectivePreset(tone, readTaStore());
+                const toLoad = eff.effectiveName;
+                if (!toLoad) return;
+                const ok = await loadPresetByName(toLoad);
+                if (ok) switcher.activePreset = toLoad;
+            });
+        });
+
+        // Mode dropdown — Preset Switch / MIDI Program Change / Tone Automation.
+        // Tone Automation mode toggles `slopsmith-tone-automation.enabled` (settings UI has no duplicate toggle).
         const modeSelect = panel.querySelector('#ae-tone-mode');
         if (modeSelect) {
-            modeSelect.addEventListener('change', () => {
+            modeSelect.addEventListener('change', async () => {
+                const v = modeSelect.value;
                 const bypassDiv = panel.querySelector('#ae-bypass-mode');
                 const midiDiv = panel.querySelector('#ae-midi-mode');
-                if (modeSelect.value === 'midi') {
+                const autoDiv = panel.querySelector('#ae-automation-mode');
+
+                if (v === 'midi') {
                     bypassDiv?.classList.add('hidden');
+                    autoDiv?.classList.add('hidden');
                     midiDiv?.classList.remove('hidden');
+                    const cur = readTaStore();
+                    if (cur.enabled) {
+                        cur.enabled = false;
+                        writeTaStore(cur);
+                        window._toneSwitcher = null;
+                        try { await applyToneMappingsNow(songKey, { force: true }); } catch (e) { /* ignore */ }
+                        await loadDefaultPreset('tone-automation-off');
+                    }
+                    window._preloadedSongKey = null;
+                } else if (v === 'automation') {
+                    bypassDiv?.classList.add('hidden');
+                    midiDiv?.classList.add('hidden');
+                    autoDiv?.classList.remove('hidden');
+                    saveMidiPCConfig(songKey, null);
+                    const cur = readTaStore();
+                    cur.enabled = true;
+                    writeTaStore(cur);
+                    window._preloadedSongKey = null;
+                    await activateToneAutomationForCurrentSong();
                 } else {
+                    // Preset Switch (bypass)
                     bypassDiv?.classList.remove('hidden');
                     midiDiv?.classList.add('hidden');
-                    // Clear MIDI config when switching to bypass mode
+                    autoDiv?.classList.add('hidden');
                     saveMidiPCConfig(songKey, null);
+                    const cur = readTaStore();
+                    if (cur.enabled) {
+                        cur.enabled = false;
+                        writeTaStore(cur);
+                        await deactivateToneAutomation();
+                    }
+                    window._preloadedSongKey = null;
                 }
             });
         }
@@ -1106,18 +1775,61 @@
         if (cb) cb.addEventListener('change', () => {
             autoSwitchEnabled = cb.checked;
             localStorage.setItem('slopsmith-tone-auto-switch', String(autoSwitchEnabled));
-            const settingsCb = $('ae-auto-switch');
-            if (settingsCb) settingsCb.checked = autoSwitchEnabled;
             if (!autoSwitchEnabled) stopToneMonitor();
         });
 
-        // Show active tone indicator
-        if (toneMonitorInterval) {
-            const updateActive = setInterval(() => {
-                const el = document.getElementById('ae-active-tone');
-                if (!el) { clearInterval(updateActive); return; }
-                if (toneSwitcher?.activeTone) el.textContent = 'Active: ' + toneSwitcher.activeTone;
-            }, 200);
+        // Fill VST dropdown after UI is visible. getChainState() may block the JS thread
+        // synchronously; deferring avoids an endless "Loading..." on the whole panel.
+        void (async function hydrateChainVstOptions() {
+            const root = document.getElementById('ae-tone-panel-float');
+            if (!root) return;
+            const vstSelect = root.querySelector('#ae-midi-vst');
+            const hint = root.querySelector('#ae-midi-vst-hint');
+            if (!vstSelect) return;
+            const apiLocal = window.slopsmithDesktop?.audio;
+            if (!apiLocal || typeof apiLocal.getChainState !== 'function') {
+                vstSelect.innerHTML = '<option value="">(no audio bridge)</option>';
+                return;
+            }
+            let vstSlots = [];
+            try {
+                const chain = await Promise.race([
+                    Promise.resolve(apiLocal.getChainState()),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+                ]);
+                if (Array.isArray(chain)) vstSlots = chain.filter(s => s.type === 0);
+            } catch (e) {
+                console.warn('[audio-engine] getChainState failed:', e.message || e);
+                vstSelect.innerHTML = '<option value="">(unavailable)</option>';
+                if (hint) hint.textContent = 'Could not load the VST list. Check the audio engine or try again.';
+                return;
+            }
+            let cfg = null;
+            try {
+                cfg = getMidiPCConfig(songKey);
+            } catch (e) { /* ignore */ }
+            if (vstSlots.length === 0) {
+                vstSelect.innerHTML = '<option value="">(no VST in chain)</option>';
+                if (hint) hint.textContent = 'Load a VST in the audio panel, then reopen this panel.';
+            } else {
+                const esc = (t) => String(t ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+                vstSelect.innerHTML = vstSlots.map(s =>
+                    `<option value="${s.id}" ${cfg?.vstSlotId === s.id ? 'selected' : ''}>${esc(s.name)}</option>`
+                ).join('');
+                if (hint) hint.textContent = '';
+            }
+        })();
+
+        } catch (err) {
+            console.error('[audio-engine] Failed to render tone panel:', err);
+            const stillThere = document.getElementById('ae-tone-panel-float');
+            if (stillThere) {
+                stillThere.innerHTML = `<div class="flex items-center justify-between mb-3">
+                    <span class="text-sm font-semibold text-slate-200">Tone Switching</span>
+                    <button type="button" onclick="window._closeChainPanel && window._closeChainPanel()" class="text-slate-500 hover:text-white text-lg leading-none">&times;</button>
+                </div>
+                <div class="text-xs text-red-400">Failed to load: ${(err && err.message) || 'unknown error'}</div>`;
+            }
         }
     }
 
@@ -1125,54 +1837,349 @@
     const _origPlaySong = window.playSong;
     if (_origPlaySong) {
         window.playSong = async function(filename, arrangement) {
+            if (window._aeMarkSongTransition) window._aeMarkSongTransition(7000);
             stopToneMonitor();
+            closeTonePanel();
             await _origPlaySong(filename, arrangement);
             // Inject tones button into player controls
             setTimeout(() => injectPlayerToneButton(), 500);
-            // Wait a moment for tone data to arrive via WebSocket
-            setTimeout(() => {
-                renderToneMappingUI();
-                if (autoSwitchEnabled) {
-                    // Skip inner IIFE preload if MIDI mode is active (outer IIFE handles it)
-                    const songKey = window._currentSongFile || document.title || '';
-                    const allData = JSON.parse(localStorage.getItem('slopsmith-tone-mappings') || '{}');
-                    const midiCfg = allData.midiPC?.[songKey];
-                    if (midiCfg?.mode === 'midi') {
-                        console.log('[tone-switcher] MIDI mode active, skipping bypass preload');
-                    } else {
-                        const hw = window.highway || window._slopsmithHighway;
-                        if (!hw) return;
-                        const toneChanges = hw.getToneChanges ? hw.getToneChanges() : [];
-                        const toneBase = hw.getToneBase ? hw.getToneBase() : '';
-                        if (toneChanges.length > 0) {
-                            const mappings = getToneMappings(songKey);
-                            if (Object.keys(mappings).length > 0) {
-                                toneSwitcher = new ToneSwitcher();
-                                window._toneSwitcher = toneSwitcher;
-                                toneSwitcher.preloadForSong(toneChanges, toneBase, mappings)
-                                    .then(() => startToneMonitor())
-                                    .catch(e => console.error('[tone-switcher] Preload error:', e));
-                            }
-                        }
-                    }
-                }
-            }, 2000);
+            // Tone-chain preload is handled only by the outer playSong timer (single path — avoids
+            // stacking the menu chain with a second preload).
         };
     }
 
-    // Auto-switch toggle
-    const autoSwitchEl = $('ae-auto-switch');
-    if (autoSwitchEl) {
-        autoSwitchEl.checked = autoSwitchEnabled;
-        autoSwitchEl.addEventListener('change', () => {
-            autoSwitchEnabled = autoSwitchEl.checked;
-            localStorage.setItem('slopsmith-tone-auto-switch', String(autoSwitchEnabled));
-            if (!autoSwitchEnabled) stopToneMonitor();
+    // ── Tone Automation ────────────────────────────────────────────────────────
+    /** Default keyword dictionaries for the Auto Classifier Filters. Each
+     *  category accepts user-supplied custom keywords on top of these. */
+    const TA_DEFAULT_KEYWORDS = {
+        solo:     ['lead', 'solo'],
+        dist:     ['dist', 'distortion', 'fuzz', 'gain', 'higain', 'highgain', 'dis'],
+        od:       ['overdrive', 'od', 'drive', 'crunch', 'dirty', 'breakup', 'over'],
+        clean:    ['clean', 'twang', 'chime', 'sparkle'],
+        bass:     ['bass', 'bass gtr', 'bassgtr', 'bs'],
+        acoustic: ['acoustic', 'acous', 'acc', 'ac'],
+        mod:      ['wah', 'chorus', 'verb', 'reverb', 'delay', 'echo', 'trem', 'tremolo',
+                   'phase', 'phaser', 'flange', 'flanger', 'filter', 'mod', 'fx'],
+    };
+
+    /** Highest priority wins when an input matches more than one category. */
+    const TA_PRECEDENCE = ['solo', 'dist', 'od', 'clean', 'bass', 'acoustic', 'mod'];
+
+    const TA_CATEGORY_LABELS = {
+        solo: 'Solo', dist: 'Dist', od: 'OD',
+        clean: 'Clean', bass: 'Bass', acoustic: 'Acoustic', mod: 'Mod',
+    };
+
+    const TA_TARGET_ROWS = [
+        { key: 'clean',    label: 'Auto Clean Target' },
+        { key: 'bass',     label: 'Auto Bass Target' },
+        { key: 'acoustic', label: 'Auto Acoustic Target' },
+        { key: 'od',       label: 'Auto OD Target' },
+        { key: 'dist',     label: 'Auto Dist Target' },
+        { key: 'mod',      label: 'Auto Mod Target' },
+        { key: 'solo',     label: 'Auto Solo Target' },
+        { key: 'idle',     label: 'Idle Target (fallback)' },
+    ];
+
+    function readTaStore() {
+        try {
+            const raw = JSON.parse(localStorage.getItem('slopsmith-tone-automation') || '{}') || {};
+            const customKeywords = (raw.customKeywords && typeof raw.customKeywords === 'object' && !Array.isArray(raw.customKeywords)) ? raw.customKeywords : {};
+            const targets = (raw.targets && typeof raw.targets === 'object' && !Array.isArray(raw.targets)) ? raw.targets : {};
+            return { enabled: !!raw.enabled, customKeywords, targets };
+        } catch (e) {
+            return { enabled: false, customKeywords: {}, targets: {} };
+        }
+    }
+
+    function writeTaStore(cfg) {
+        localStorage.setItem('slopsmith-tone-automation', JSON.stringify({
+            enabled: !!cfg?.enabled,
+            customKeywords: cfg?.customKeywords && typeof cfg.customKeywords === 'object' ? cfg.customKeywords : {},
+            targets: cfg?.targets && typeof cfg.targets === 'object' ? cfg.targets : {},
+        }));
+    }
+
+    function parseTaKeywordList(value) {
+        if (!value) return [];
+        if (Array.isArray(value)) return value.map(v => String(v).trim()).filter(Boolean);
+        return String(value).split(/[,\n;]+/).map(v => v.trim()).filter(Boolean);
+    }
+
+    function getTaCategoryKeywords(category, cfg) {
+        const c = cfg || readTaStore();
+        const defaults = TA_DEFAULT_KEYWORDS[category] || [];
+        const custom = parseTaKeywordList(c.customKeywords?.[category]);
+        return [...defaults, ...custom];
+    }
+
+    /** Builds a case-insensitive regex that matches any keyword anchored at a
+     *  left word boundary (start of string or non-alphanumeric). The right side
+     *  stays open so 'dist' matches 'distortion' and 'mod' matches 'modulator'.
+     *  Longer keywords are tried first so 'distortion' wins over 'dist'. */
+    function buildTaKeywordRegex(keywords) {
+        const cleaned = (keywords || [])
+            .map(k => String(k || '').trim().toLowerCase())
+            .filter(Boolean);
+        if (cleaned.length === 0) return null;
+        cleaned.sort((a, b) => b.length - a.length);
+        const escaped = cleaned.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+        return new RegExp(`(?:^|[^a-z0-9])(?:${escaped.join('|')})`, 'i');
+    }
+
+    function classifyTaCategory(input, cfg) {
+        const text = String(input || '').toLowerCase();
+        if (!text) return null;
+        const c = cfg || readTaStore();
+        for (const cat of TA_PRECEDENCE) {
+            const re = buildTaKeywordRegex(getTaCategoryKeywords(cat, c));
+            if (re && re.test(text)) return cat;
+        }
+        return null;
+    }
+
+    function resolveTaPreset(input, cfg) {
+        const c = cfg || readTaStore();
+        const cat = classifyTaCategory(input, c);
+        const targets = c.targets || {};
+        if (cat && targets[cat]) return { presetName: targets[cat], category: cat };
+        return { presetName: targets.idle || null, category: 'idle' };
+    }
+
+    /** Session-only Chain overrides per tone (Tone Automation). Cleared on each new `playSong`. */
+    if (typeof window._aeTaSessionOverrides !== 'object' || window._aeTaSessionOverrides === null) {
+        window._aeTaSessionOverrides = {};
+    }
+
+    /** Effective preset for a tone name: classifier target ± optional modal override for this playback. */
+    function getTaSessionEffectivePreset(toneName, cfg) {
+        const t = String(toneName || '').trim();
+        const c = cfg || readTaStore();
+        const autoResolved = resolveTaPreset(t, c);
+        const autoName = autoResolved.presetName || null;
+        const ov = window._aeTaSessionOverrides;
+        if (ov && Object.prototype.hasOwnProperty.call(ov, t)) {
+            const m = ov[t];
+            const effectiveName = (m !== undefined && m !== '') ? m : autoName;
+            const showStar = effectiveName !== autoName;
+            return {
+                autoName,
+                effectiveName,
+                showStar,
+                category: autoResolved.category,
+            };
+        }
+        return {
+            autoName,
+            effectiveName: autoName,
+            showStar: false,
+            category: autoResolved.category,
+        };
+    }
+
+    async function loadPresetByName(presetName) {
+        if (!presetName) return false;
+        const presets = getPresets();
+        const preset = presets[presetName];
+        if (!preset?.nativePreset) return false;
+        const ok = await replaceChainWithPresetBlob(preset, `tone-automation:${presetName}`);
+        if (!ok) console.error('[tone-automation] Failed to load preset:', presetName);
+        return ok;
+    }
+
+    /** Drop-in replacement for `_toneSwitcher` that classifies tone names through
+     *  the Tone Automation dictionaries and loads the matching target preset.
+     *  Repeated calls that resolve to the same preset are no-ops to keep the
+     *  audio chain stable while crossing tone-change boundaries. */
+    class ToneAutomationSwitcher {
+        constructor() {
+            this.activeTone = null;
+            this.activePreset = null;
+            this.taSwitcher = true;
+        }
+        async switchToTone(name) {
+            const input = String(name || '').trim();
+            if (!input) return;
+            this.activeTone = input;
+            const cfg = readTaStore();
+            const { effectiveName: presetName, autoName, category } = getTaSessionEffectivePreset(input, cfg);
+            if (!presetName || presetName === this.activePreset) return;
+            const ok = await loadPresetByName(presetName);
+            if (ok) {
+                this.activePreset = presetName;
+                const tag = autoName !== presetName ? ' (session override)' : '';
+                console.log('[tone-automation] tone:', input, '→', category, '→', presetName, tag);
+            }
+        }
+    }
+
+    /** Applies the appropriate target preset to a free-form input string (song
+     *  filename, tone name, or manual user text). When `force` is set, ignores
+     *  the enabled toggle so the modal's "Apply" button can still trigger. */
+    async function applyToneAutomationFor(input, options = {}) {
+        const cfg = readTaStore();
+        if (!cfg.enabled && !options.force) return false;
+        const { presetName, category } = resolveTaPreset(input, cfg);
+        if (!presetName) return false;
+        const ok = await loadPresetByName(presetName);
+        if (ok) console.log('[tone-automation] input:', input, '→', category, '→', presetName);
+        return ok;
+    }
+
+    /** Installs a TA-driven `_toneSwitcher` for the loaded song. Called from
+     *  the playSong wrapper when Tone Automation Mode is on. Picks the initial
+     *  preset from the song's base tone or falls back to the song filename. */
+    async function installTaSwitcherForSong(songFile, toneChanges, toneBase) {
+        const cfg = readTaStore();
+        if (!cfg.enabled) return false;
+        const switcher = new ToneAutomationSwitcher();
+        window._toneSwitcher = switcher;
+        const initialInput = String(toneBase || songFile || '').trim();
+        if (initialInput) await switcher.switchToTone(initialInput);
+        return true;
+    }
+
+    function renderToneAutomationFilters() {
+        const container = $('ae-ta-filters');
+        if (!container) return;
+        const cfg = readTaStore();
+        container.innerHTML = '';
+        for (const cat of TA_PRECEDENCE) {
+            const defaults = TA_DEFAULT_KEYWORDS[cat] || [];
+            const custom = parseTaKeywordList(cfg.customKeywords?.[cat]).join(', ');
+            const wrap = document.createElement('div');
+            wrap.className = 'rounded bg-slate-800/40 px-2 py-1.5';
+            wrap.innerHTML = `
+                <div class="flex items-baseline gap-2 mb-1">
+                    <span class="text-xs font-medium text-slate-300 w-16 shrink-0">${escHtml(TA_CATEGORY_LABELS[cat])}</span>
+                    <span class="text-[11px] text-slate-500 truncate" title="${escHtml(defaults.join(', '))}">defaults: ${escHtml(defaults.join(', '))}</span>
+                </div>
+                <input type="text"
+                    data-ta-custom="${escHtml(cat)}"
+                    placeholder="Custom keywords (comma-separated)"
+                    value="${escHtml(custom)}"
+                    class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1 text-xs text-slate-200">
+            `;
+            container.appendChild(wrap);
+        }
+        container.querySelectorAll('input[data-ta-custom]').forEach(inp => {
+            inp.addEventListener('change', () => {
+                const cur = readTaStore();
+                cur.customKeywords = cur.customKeywords || {};
+                cur.customKeywords[inp.dataset.taCustom] = inp.value;
+                writeTaStore(cur);
+            });
         });
     }
 
+    function renderToneAutomationTargets() {
+        const container = $('ae-ta-targets');
+        if (!container) return;
+        const cfg = readTaStore();
+        const presetNames = Object.keys(getPresets());
+        container.innerHTML = '';
+        for (const row of TA_TARGET_ROWS) {
+            const current = cfg.targets?.[row.key] || '';
+            const div = document.createElement('div');
+            div.className = 'flex items-center gap-2';
+            div.innerHTML = `
+                <span class="text-xs text-slate-400 w-32 shrink-0">${escHtml(row.label)}</span>
+                <select data-ta-target="${escHtml(row.key)}" class="flex-1 bg-slate-700 border border-slate-600 rounded px-2 py-1 text-xs text-slate-200">
+                    <option value="">-- none --</option>
+                    ${presetNames.map(n => `<option value="${escHtml(n)}" ${current === n ? 'selected' : ''}>${escHtml(n)}</option>`).join('')}
+                </select>
+            `;
+            container.appendChild(div);
+        }
+        container.querySelectorAll('select[data-ta-target]').forEach(sel => {
+            sel.addEventListener('change', () => {
+                const cur = readTaStore();
+                cur.targets = cur.targets || {};
+                if (sel.value) cur.targets[sel.dataset.taTarget] = sel.value;
+                else delete cur.targets[sel.dataset.taTarget];
+                writeTaStore(cur);
+            });
+        });
+    }
+
+    function renderToneAutomationSettings() {
+        renderToneAutomationFilters();
+        renderToneAutomationTargets();
+    }
+
+    async function activateToneAutomationForCurrentSong() {
+        const songKey = getCurrentSongKey();
+        const hw = window.highway || window._slopsmithHighway;
+        const toneChanges = hw?.getToneChanges ? hw.getToneChanges() : [];
+        const toneBase = hw?.getToneBase ? hw.getToneBase() : '';
+        await installTaSwitcherForSong(songKey, toneChanges, toneBase);
+    }
+
+    async function deactivateToneAutomation() {
+        window._toneSwitcher = null;
+        const songKey = getCurrentSongKey();
+        // Try to restore any manual tone mapping the user had configured first;
+        // if there isn't one, fall back to the global default preset.
+        try { await applyToneMappingsNow(songKey, { force: true }); } catch (e) { /* ignore */ }
+        await loadDefaultPreset('tone-automation-off');
+    }
+
+    function setupToneAutomationSettingsEvents() {
+        renderToneAutomationSettings();
+    }
+
+    /** Public hooks consumed by the playSong wrapper in IIFE 2 below and by the
+     *  Chain modal toggle. */
+    window._aeToneAutomation = {
+        isEnabled: () => readTaStore().enabled,
+        getConfig: readTaStore,
+        getSessionEffectivePreset: getTaSessionEffectivePreset,
+        clearSessionOverrides() {
+            window._aeTaSessionOverrides = {};
+        },
+        setEnabled(value) {
+            const cur = readTaStore();
+            cur.enabled = !!value;
+            writeTaStore(cur);
+        },
+        classify: classifyTaCategory,
+        resolvePreset: resolveTaPreset,
+        applyFor: applyToneAutomationFor,
+        installSwitcherForSong: installTaSwitcherForSong,
+        renderTargets: renderToneAutomationTargets,
+        renderSettings: renderToneAutomationSettings,
+        ToneAutomationSwitcher,
+        TA_DEFAULT_KEYWORDS,
+        TA_CATEGORY_LABELS,
+        TA_TARGET_ROWS,
+    };
+
     // ── Start ─────────────────────────────────────────────────────────────────
-    init().then(() => renderPresetList()).catch(e => console.error('[audio-engine] init error:', e));
+    init().then(() => {
+        renderPresetList();
+        renderToneAutomationSettings();
+    }).catch(e => console.error('[audio-engine] init error:', e));
+
+    if (window.slopsmith?.on) {
+        let _reapplyDebounceTimer = null;
+        let _reapplyFollowupTimer = null;
+        const scheduleReapply = () => {
+            window._preloadedSongKey = null;
+            const songKey = getCurrentSongKey();
+            if (_reapplyDebounceTimer) clearTimeout(_reapplyDebounceTimer);
+            if (_reapplyFollowupTimer) clearTimeout(_reapplyFollowupTimer);
+            _reapplyDebounceTimer = setTimeout(() => {
+                void applyToneMappingsNow(songKey);
+                void refreshTonePanelIfOpen();
+            }, 600);
+            _reapplyFollowupTimer = setTimeout(() => {
+                void applyToneMappingsNow(songKey);
+                void refreshTonePanelIfOpen();
+            }, 1500);
+        };
+        window.slopsmith.on('arrangement:changed', scheduleReapply);
+        window.slopsmith.on('song:ready', scheduleReapply);
+    }
 })();
 
 // ── Chain button + tone auto-switch (runs outside IIFE so it works without audio API) ──
@@ -1182,7 +2189,34 @@
 
     let _toneMonitor = null;
     let _lastTone = null;
-    let _preloadedSongKey = null;
+    /** Song + arrangement — invalidates preload when switching Lead/Bass/etc. on the same file */
+    let _preloadedToneCacheKey = null;
+
+    function normalizeSongKey(raw) {
+        return String(raw || '')
+            .replace(/\\/g, '/')
+            .trim();
+    }
+
+    function getCurrentSongKey() {
+        const current = normalizeSongKey(window._currentSongFile);
+        if (current) {
+            window._slopsmithSongKey = current;
+            return current;
+        }
+        return normalizeSongKey(window._slopsmithSongKey || document.title || '');
+    }
+
+    function getTonePreloadCacheKey() {
+        const sk = getCurrentSongKey();
+        const arr = String(window.slopsmith?.currentSong?.arrangement || '').trim().toLowerCase();
+        return `${sk}::${arr}`;
+    }
+
+    function getToneChangeTime(tc) {
+        const t = tc?.t ?? tc?.time ?? tc?.timestamp ?? tc?.at;
+        return Number.isFinite(t) ? t : Infinity;
+    }
 
     function showToneToast(name) {
         let toast = document.getElementById('tone-toast');
@@ -1198,26 +2232,58 @@
         toast._timer = setTimeout(() => { toast.style.opacity = '0'; }, 2000);
     }
 
+    function applyPresetGainLevels(api, preset) {
+        const inputLin = Number.isFinite(Number(preset?.inputGain)) ? Number(preset.inputGain) : 1;
+        const outputLin = Number.isFinite(Number(preset?.outputGain)) ? Number(preset.outputGain) : 1;
+
+        const inputSlider = document.getElementById('ae-input-gain');
+        const outputSlider = document.getElementById('ae-output-gain');
+        const inputLabel = document.getElementById('ae-input-gain-label');
+        const outputLabel = document.getElementById('ae-output-gain-label');
+
+        const linToDb = window._aeLinearGainToDb || ((l) => {
+            const x = Number(l);
+            if (!Number.isFinite(x) || x <= 0) return -60;
+            return Math.min(12, Math.max(-60, 20 * Math.log10(x)));
+        });
+        const fmt = window._aeFormatGainDbLabel || ((db) => `${Number(db).toFixed(1)} dB`);
+        const inDb = linToDb(inputLin);
+        const outDb = linToDb(outputLin);
+
+        if (inputSlider) inputSlider.value = String(inDb);
+        if (outputSlider) outputSlider.value = String(outDb);
+        if (inputLabel) inputLabel.textContent = fmt(inDb);
+        if (outputLabel) outputLabel.textContent = fmt(outDb);
+
+        if (api?.setGain) {
+            api.setGain('input', inputLin);
+            api.setGain('output', outputLin);
+        }
+    }
+
     function startToneAutoSwitch() {
         if (_toneMonitor) clearInterval(_toneMonitor);
         _lastTone = null;
 
         _toneMonitor = setInterval(() => {
-            const hw = window.highway;
+            const hw = window.highway || window._slopsmithHighway;
             if (!hw || !hw.getTime) return;
 
             const autoOn = localStorage.getItem('slopsmith-tone-auto-switch') === 'true';
-            if (!autoOn) return;
+            const taOn = window._aeToneAutomation?.isEnabled?.() === true;
+            if (!autoOn && !taOn) return;
 
             const t = hw.getTime();
             const changes = hw.getToneChanges ? hw.getToneChanges() : [];
             const base = hw.getToneBase ? hw.getToneBase() : '';
             if (changes.length === 0) return;
 
-            let activeTone = base;
+            let activeTone = String(base || '').trim();
             for (const tc of changes) {
-                if (tc.t <= t) activeTone = tc.name;
-                else break;
+                if (getToneChangeTime(tc) <= t) {
+                    const n = String(tc?.name || '').trim();
+                    if (n) activeTone = n;
+                } else break;
             }
 
             if (activeTone && activeTone !== _lastTone) {
@@ -1235,22 +2301,47 @@
     }
 
     window.playSong = async function(filename, arrangement) {
+        if (window._aeMarkSongTransition) window._aeMarkSongTransition(7000);
         if (_toneMonitor) { clearInterval(_toneMonitor); _toneMonitor = null; }
         _lastTone = null;
+        window._aeTaSessionOverrides = {};
+        if (window._closeChainPanel) window._closeChainPanel();
         window._currentSongFile = decodeURIComponent(filename);
-        // Reset preload tracking for new song
-        if (_preloadedSongKey && _preloadedSongKey !== window._currentSongFile) {
-            _preloadedSongKey = null;
-            window._toneSwitcher = null;
+        window._slopsmithSongKey = normalizeSongKey(window._currentSongFile);
+        // Reset preload tracking when the song file changes (not when only arrangement/track changes)
+        const skNow = getCurrentSongKey();
+        if (_preloadedToneCacheKey) {
+            const cachedSongKey = _preloadedToneCacheKey.split('::')[0];
+            if (cachedSongKey !== skNow) {
+                _preloadedToneCacheKey = null;
+                window._toneSwitcher = null;
+            }
         }
 
         await origPS(filename, arrangement);
+
+        // Tear down the menu/default chain after load (never await clearChain here — it can re-enter
+        // the audio host during playSong and crash). The timed preload below rebuilds song presets.
+        setTimeout(() => {
+            if (window._aeClearChainForNewSong) {
+                void window._aeClearChainForNewSong().catch((e) => {
+                    console.warn('[audio-engine] clearChainForNewSong failed:', e);
+                });
+            }
+        }, 400);
 
         // Inject Chain button
         setTimeout(() => {
             const controls = document.getElementById('player-controls');
             if (!controls || document.getElementById('btn-chain-switch')) return;
             const closeBtn = controls.querySelector('button[onclick*="showScreen"]');
+            if (closeBtn && !closeBtn.dataset.chainPanelCloseBound) {
+                closeBtn.addEventListener('click', () => {
+                    if (window._closeChainPanel) window._closeChainPanel();
+                    if (window._aeLoadDefaultPreset) void window._aeLoadDefaultPreset('player-exit');
+                }, { capture: true });
+                closeBtn.dataset.chainPanelCloseBound = '1';
+            }
             const btn = document.createElement('button');
             btn.id = 'btn-chain-switch';
             btn.className = 'px-3 py-1.5 bg-orange-900/40 hover:bg-orange-900/60 rounded-lg text-xs text-orange-300 transition';
@@ -1262,38 +2353,100 @@
 
         // Start tone monitoring and preload presets after WebSocket delivers tone data
         setTimeout(async () => {
+            try {
             startToneAutoSwitch();
 
             // Preload presets for tone switching
             const autoOn = localStorage.getItem('slopsmith-tone-auto-switch') === 'true';
             const api = window.slopsmithDesktop?.audio;
-            const hw = window.highway;
-            if (!autoOn || !api || !hw) return;
+            const hw = window.highway || window._slopsmithHighway;
+            if (!api || !hw) return;
 
-            const toneChanges = hw.getToneChanges ? hw.getToneChanges() : [];
-            const toneBase = hw.getToneBase ? hw.getToneBase() : '';
-            if (toneChanges.length === 0) return;
+            const songKeyPreflight = getCurrentSongKey();
+            let midiPreflight = null;
+            try {
+                const rawMap = JSON.parse(localStorage.getItem('slopsmith-tone-mappings') || '{}') || {};
+                midiPreflight = rawMap.midiPC?.[songKeyPreflight];
+            } catch (e) { /* ignore */ }
+            // MIDI PC mode talks to an existing VST slot — do not wipe the chain here (outer MIDI block
+            // does not reload processors). Bypass / Tone Automation need a clean slate vs menu default.
+            const skipPreflightClear = midiPreflight?.mode === 'midi' && Number(midiPreflight.vstSlotId) >= 0;
+            if (!skipPreflightClear) {
+                try {
+                    await api.clearChain();
+                    try {
+                        localStorage.setItem('slopsmith-signal-chain', '[]');
+                    } catch (e) { /* ignore */ }
+                } catch (e) {
+                    console.warn('[tone-switcher] preflight clearChain:', e);
+                }
+            }
 
-            const songKey = window._currentSongFile || document.title || '';
+            // Wait briefly for highway tone data to arrive (ws may still be connecting).
+            let toneChanges = hw.getToneChanges ? hw.getToneChanges() : [];
+            let toneBase = hw.getToneBase ? hw.getToneBase() : '';
+            for (let attempt = 0; attempt < 6 && toneChanges.length === 0 && !toneBase; attempt++) {
+                await new Promise(r => setTimeout(r, 500));
+                toneChanges = hw.getToneChanges ? hw.getToneChanges() : [];
+                toneBase = hw.getToneBase ? hw.getToneBase() : '';
+            }
+
+            const songKey = getCurrentSongKey();
 
             // Check for MIDI PC mode
-            const allMappingsData = JSON.parse(localStorage.getItem('slopsmith-tone-mappings') || '{}');
+            let allMappingsData = {};
+            try { allMappingsData = JSON.parse(localStorage.getItem('slopsmith-tone-mappings') || '{}') || {}; }
+            catch (e) { allMappingsData = {}; }
             const midiConfig = allMappingsData.midiPC?.[songKey];
             const wantsMidi = midiConfig?.mode === 'midi';
 
             // Check if MIDI config was just saved (clears window._preloadedSongKey)
-            if (window._preloadedSongKey === null) _preloadedSongKey = null;
+            if (window._preloadedSongKey === null) _preloadedToneCacheKey = null;
 
-            // Skip if already preloaded for this song with the same mode
-            if (_preloadedSongKey === songKey && window._toneSwitcher) {
+            // Skip if already preloaded for this song+arrangement with the same mode AND timeline data is present.
+            // Songs without tone_changes have a no-op switchToTone, so re-entry must force re-apply.
+            const cacheKeyNow = getTonePreloadCacheKey();
+            const hasTimelineForCacheCheck = (toneChanges?.length || 0) > 0 || !!toneBase;
+            if (_preloadedToneCacheKey === cacheKeyNow && window._toneSwitcher && hasTimelineForCacheCheck) {
                 const currentIsMidi = !!window._toneSwitcher.midiMode;
                 if (currentIsMidi === wantsMidi) {
-                    window._toneSwitcher.switchToTone(toneBase);
+                    const tbTrim = String(toneBase || '').trim();
+                    const tcArr = Array.isArray(toneChanges) ? toneChanges : [];
+                    let effBase = tbTrim;
+                    if (!effBase && tcArr.length > 0) {
+                        const sorted = [...tcArr].filter(tc => String(tc?.name || '').trim())
+                            .sort((a, b) => getToneChangeTime(a) - getToneChangeTime(b));
+                        if (sorted.length) effBase = String(sorted[0].name).trim();
+                    }
+                    const switchKey = effBase || tbTrim;
+                    window._toneSwitcher.switchToTone(switchKey);
+                    const tpm = window._toneSwitcher.tonePresetMap;
+                    const p = tpm && switchKey ? tpm[switchKey] : null;
+                    if (p) applyPresetGainLevels(api, p);
                     return;
                 }
                 // Mode changed — reset and re-preload
-                _preloadedSongKey = null;
+                _preloadedToneCacheKey = null;
                 window._toneSwitcher = null;
+            }
+            if (_preloadedToneCacheKey === cacheKeyNow && !hasTimelineForCacheCheck) {
+                _preloadedToneCacheKey = null;
+                window._toneSwitcher = null;
+            }
+
+            // Tone Automation overrides both MIDI and bypass modes when enabled.
+            // It installs a classifier-driven `_toneSwitcher`; the auto-switch
+            // monitor above invokes it on every tone change.
+            if (window._aeToneAutomation?.isEnabled?.()) {
+                const installed = await window._aeToneAutomation.installSwitcherForSong(
+                    window._currentSongFile || filename, toneChanges, toneBase
+                );
+                if (installed) {
+                    _preloadedToneCacheKey = getTonePreloadCacheKey();
+                    startToneAutoSwitch();
+                    console.log('[tone-automation] installed for song:', window._currentSongFile || filename);
+                    return;
+                }
             }
 
             console.log('[tone-switcher] Mode:', wantsMidi ? 'MIDI' : 'bypass', 'config:', JSON.stringify(midiConfig));
@@ -1322,7 +2475,7 @@
                 if (midiMappings[toneBase] !== undefined && _apiInit?.sendMidiToSlot) {
                     _apiInit.sendMidiToSlot(midiConfig.vstSlotId, 0, midiConfig.channel || 1, midiMappings[toneBase]);
                 }
-                _preloadedSongKey = songKey;
+                _preloadedToneCacheKey = getTonePreloadCacheKey();
                 console.log('[tone-switcher] MIDI PC mode for:', Object.keys(midiMappings));
             } else {
                 // Bypass-toggle mode — preload all presets
@@ -1330,18 +2483,73 @@
                 if (Object.keys(mappings).length === 0) return;
 
                 const presets = JSON.parse(localStorage.getItem('slopsmith-chain-presets') || '{}');
-                const toneNames = new Set([toneBase]);
-                for (const tc of toneChanges) toneNames.add(tc.name);
+                const hasTimelineToneData = toneChanges.length > 0 || !!toneBase;
+                if (!hasTimelineToneData) {
+                    const toneNames = await getOriginalToneNamesForCurrentArrangement(songKey);
+                    const lookup = (name) => (window._aeResolveTonePresetName
+                        ? window._aeResolveTonePresetName(mappings, name)
+                        : ((window._aeFindMappingForTone ? window._aeFindMappingForTone(mappings, name) : mappings[name]) || mappings['$default']));
+                    const matchedTone = toneNames.find(n => !!lookup(n));
+                    const selectedTone = matchedTone || '$default';
+                    const firstNonDefaultKey = Object.keys(mappings).filter(k => k !== '$default')[0];
+                    const presetName = lookup(selectedTone) || (firstNonDefaultKey ? mappings[firstNonDefaultKey] : null);
+                    const preset = presetName ? presets[presetName] : null;
+                    if (preset?.nativePreset) {
+                        if (await window._aeReplaceChainWithPresetBlob?.(preset, 'preload-no-timeline')) {
+                            console.log('[tone-switcher] Loaded mapped preset (no tone_changes):', selectedTone, '->', presetName);
+                        }
+                    } else if (window._aeLoadDefaultPreset) {
+                        await window._aeLoadDefaultPreset('tone-none');
+                    }
+                    window._toneSwitcher = {
+                        activeTone: selectedTone,
+                        toneSlotMap: {},
+                        switchToTone() { /* no timeline tones available for song */ }
+                    };
+                    _preloadedToneCacheKey = getTonePreloadCacheKey();
+                    return;
+                }
+
+                const rawTc = Array.isArray(toneChanges) ? toneChanges : [];
+                const tbTrim = String(toneBase || '').trim();
+                const toneNameSet = new Set();
+                if (tbTrim) toneNameSet.add(tbTrim);
+                for (const tc of rawTc) {
+                    const n = String(tc?.name || '').trim();
+                    if (n) toneNameSet.add(n);
+                }
+                let effectiveBase = tbTrim;
+                if (!effectiveBase && rawTc.length > 0) {
+                    const sorted = [...rawTc]
+                        .filter(tc => String(tc?.name || '').trim())
+                        .sort((a, b) => getToneChangeTime(a) - getToneChangeTime(b));
+                    if (sorted.length) effectiveBase = String(sorted[0].name).trim();
+                }
+                if (!effectiveBase && toneNameSet.size > 0) {
+                    effectiveBase = toneNameSet.values().next().value;
+                }
+
+                if (toneNameSet.size === 0) {
+                    console.warn('[tone-switcher] Bypass preload: no valid tone names');
+                    _preloadedToneCacheKey = getTonePreloadCacheKey();
+                    return;
+                }
 
                 await api.clearChain();
                 window._toneSwitcher = null;
                 const toneSlotMap = {};
+                const tonePresetMap = {};
 
-                for (const toneName of toneNames) {
-                    const presetName = mappings[toneName] || mappings['$default'];
+                const lookupBypass = (name) => (window._aeResolveTonePresetName
+                    ? window._aeResolveTonePresetName(mappings, name)
+                    : ((window._aeFindMappingForTone ? window._aeFindMappingForTone(mappings, name) : mappings[name]) || mappings['$default']));
+                for (const toneName of toneNameSet) {
+                    const presetName = lookupBypass(toneName);
                     if (!presetName || !presets[presetName]) continue;
+                    const preset = presets[presetName];
                     const slotIds = [];
-                    for (const item of presets[presetName].items) {
+                    const chainItems = Array.isArray(preset?.items) ? preset.items : [];
+                    for (const item of chainItems) {
                         let slotId = -1;
                         if (item.type === 'NAM' && item.path) slotId = await api.loadNAMModel(item.path);
                         else if (item.type === 'IR' && item.path) slotId = await api.loadIR(item.path);
@@ -1349,29 +2557,51 @@
                         if (slotId >= 0) slotIds.push(slotId);
                     }
                     toneSlotMap[toneName] = slotIds;
-                    if (toneName !== toneBase && slotIds.length > 0) {
+                    tonePresetMap[toneName] = preset;
+                    if (toneName !== effectiveBase && slotIds.length > 0) {
                         await api.setMultiBypass(slotIds.map(id => ({ slotId: id, bypassed: true })));
                     }
                 }
 
+                const initialPreset = tonePresetMap[effectiveBase];
+                if (initialPreset) applyPresetGainLevels(api, initialPreset);
+
                 window._toneSwitcher = {
-                    activeTone: toneBase,
+                    activeTone: effectiveBase,
                     toneSlotMap,
+                    tonePresetMap,
                     switchToTone(name) {
-                        if (name === this.activeTone || !this.toneSlotMap[name]) return;
-                        const changes = [];
+                        if (name === this.activeTone) return;
+                        if (!this.toneSlotMap[name]) return;
+                        const bypassList = [];
                         if (this.activeTone && this.toneSlotMap[this.activeTone]) {
-                            for (const id of this.toneSlotMap[this.activeTone]) changes.push({ slotId: id, bypassed: true });
+                            for (const id of this.toneSlotMap[this.activeTone]) bypassList.push({ slotId: id, bypassed: true });
                         }
-                        for (const id of this.toneSlotMap[name]) changes.push({ slotId: id, bypassed: false });
-                        if (changes.length > 0) api.setMultiBypass(changes);
+                        for (const id of this.toneSlotMap[name]) bypassList.push({ slotId: id, bypassed: false });
+                        if (bypassList.length > 0) api.setMultiBypass(bypassList);
                         this.activeTone = name;
+                        const newPreset = this.tonePresetMap?.[name];
+                        if (newPreset) applyPresetGainLevels(api, newPreset);
                         console.log('[tone-switcher] Switched to:', name);
                     }
                 };
-                _preloadedSongKey = songKey;
+                _preloadedToneCacheKey = getTonePreloadCacheKey();
                 console.log('[tone-switcher] Bypass mode preloaded:', Object.keys(toneSlotMap));
+                if (autoOn) startToneAutoSwitch();
             }
-        }, 3000);
+            } catch (err) {
+                console.error('[tone-switcher] Preload failed:', err);
+            }
+        }, 800);
     };
+
+    const origStopSong = window.stopSong;
+    if (typeof origStopSong === 'function') {
+        window.stopSong = async function(...args) {
+            const result = await origStopSong.apply(this, args);
+            if (window._closeChainPanel) window._closeChainPanel();
+            if (window._aeLoadDefaultPreset) void window._aeLoadDefaultPreset('song-stop');
+            return result;
+        };
+    }
 })();
