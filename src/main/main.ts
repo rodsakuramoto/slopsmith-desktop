@@ -3,7 +3,8 @@
 
 import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron';
 import * as path from 'path';
-import { startPython, stopPython, waitForPython, getPythonPort } from './python';
+import { startPython, stopPython, waitForPython, getPythonPort, getStartupStatus, StartupStatus } from './python';
+import { IPC_STARTUP_STATUS, IPC_STARTUP_GET_STATUS, IPC_STARTUP_REQUEST_STATUS } from './ipc-channels';
 import { initAudioBridge, shutdownAudio } from './audio-bridge';
 import { initPluginManager } from './plugin-manager';
 import { initSoundfontManager } from './soundfont-manager';
@@ -20,11 +21,83 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 let mainWindow: BrowserWindow | null = null;
+let splashWindow: BrowserWindow | null = null;
+// Set to true when the user initiates a quit so the startup-status polling
+// loop can break out early instead of waiting for the 5-minute deadline.
+let appQuitting = false;
+// Milliseconds to keep the splash visible after reaching a terminal state so
+// the renderer has time to paint the final status message before the window closes.
+const SPLASH_CLOSE_DELAY_MS = 300;
+/** Total time budget for the plugin-startup polling loop. */
+const STARTUP_DEADLINE_MS = 300_000; // 5 minutes (300 000 ms)
+/** How often to poll /api/startup-status during the startup loop. */
+const STARTUP_POLL_INTERVAL_MS = 700;
+let startupStatusSnapshot: StartupStatus = {
+    running: true,
+    phase: 'booting',
+    message: 'Starting Slopsmith...',
+    currentPlugin: '',
+    loaded: 0,
+    total: 0,
+    error: null,
+};
+
 
 function getResourcesPath(): string {
     return app.isPackaged
         ? path.join(process.resourcesPath)
         : path.join(__dirname, '..', '..');
+}
+
+function publishStartupStatus(status: Partial<StartupStatus>): void {
+    startupStatusSnapshot = { ...startupStatusSnapshot, ...status };
+    if (splashWindow && !splashWindow.isDestroyed()) {
+        splashWindow.webContents.send(IPC_STARTUP_STATUS, startupStatusSnapshot);
+    }
+    if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(IPC_STARTUP_STATUS, startupStatusSnapshot);
+    }
+}
+
+function createSplashWindow(): void {
+    splashWindow = new BrowserWindow({
+        width: 560,
+        height: 360,
+        resizable: false,
+        minimizable: false,
+        maximizable: false,
+        fullscreenable: false,
+        frame: false,
+        show: true,
+        title: 'Slopsmith',
+        backgroundColor: '#050508',
+        webPreferences: {
+            preload: path.join(__dirname, 'splash-preload.js'),
+            nodeIntegration: false,
+            contextIsolation: true,
+            // sandbox must be false so the preload script can require('electron')
+            // (ipcRenderer). contextIsolation: true keeps the renderer isolated.
+            sandbox: false,
+        },
+    });
+
+    splashWindow.loadFile(path.join(__dirname, 'splash.html'));
+
+    // Treat a user-initiated close (Alt+F4 / Cmd+W) as an explicit quit so
+    // they are never stuck waiting for the full 5-minute startup deadline.
+    // preventDefault() keeps the splash visible while app.quit() propagates
+    // through before-quit → will-quit and clears the polling loop.
+    splashWindow.on('close', (event) => {
+        const currentPhase = startupStatusSnapshot.phase;
+        if (!appQuitting && currentPhase !== 'complete' && currentPhase !== 'error') {
+            event.preventDefault();
+            app.quit();
+        }
+    });
+
+    splashWindow.on('closed', () => {
+        splashWindow = null;
+    });
 }
 
 function createWindow(port: number): void {
@@ -117,6 +190,16 @@ function createWindow(port: number): void {
 async function startup(): Promise<void> {
     console.log('[main] Starting Slopsmith Desktop...');
 
+    // Register startup status IPC handlers before creating the splash window
+    // so the splash preload's immediate startup:requestStatus is handled.
+    ipcMain.handle(IPC_STARTUP_GET_STATUS, () => startupStatusSnapshot);
+    ipcMain.on(IPC_STARTUP_REQUEST_STATUS, (event) => {
+        event.sender.send(IPC_STARTUP_STATUS, startupStatusSnapshot);
+    });
+
+    createSplashWindow();
+    publishStartupStatus({ message: 'Starting backend service...', phase: 'booting', running: true });
+
     // Start Python server (Slopsmith backend)
     startPython();
 
@@ -129,9 +212,23 @@ async function startup(): Promise<void> {
     // Initialize soundfont manager IPC handlers (Audio Quality preference)
     initSoundfontManager(() => mainWindow);
 
-    // Wait for Python server to be ready
-    const port = await waitForPython();
+    // Wait for Python server to be ready; null means the backend failed to start.
+    const port = await waitForPython().catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error('[main] Backend failed to start:', message);
+        publishStartupStatus({ message: `Backend failed to start: ${message}`, phase: 'error', running: false });
+        return null;
+    });
+
+    if (port === null) {
+        await new Promise((resolve) => setTimeout(resolve, SPLASH_CLOSE_DELAY_MS));
+        if (splashWindow && !splashWindow.isDestroyed()) splashWindow.close();
+        app.quit();
+        return;
+    }
+
     console.log(`[main] Python server ready on port ${port}`);
+    publishStartupStatus({ message: 'Backend ready. Opening app window...', phase: 'core-ready', running: true });
 
     // Create the main window
     createWindow(port);
@@ -175,6 +272,28 @@ async function startup(): Promise<void> {
     ipcMain.handle('app:getConfigDir', () => {
         return app.getPath('userData');
     });
+
+    const startupDeadline = Date.now() + STARTUP_DEADLINE_MS;
+    let reachedTerminalState = false;
+    while (Date.now() < startupDeadline && !appQuitting) {
+        const status = await getStartupStatus();
+        if (appQuitting) break;
+        if (status) {
+            publishStartupStatus(status);
+            if (!status.running && (status.phase === 'complete' || status.phase === 'error')) {
+                reachedTerminalState = true;
+                break;
+            }
+        }
+        await new Promise((resolve) => setTimeout(resolve, STARTUP_POLL_INTERVAL_MS));
+    }
+    if (!reachedTerminalState && !appQuitting) {
+        publishStartupStatus({ message: 'Startup timed out', phase: 'error', running: false });
+    }
+    // Give the renderer a tick to paint the final status before closing
+    await new Promise((resolve) => setTimeout(resolve, SPLASH_CLOSE_DELAY_MS));
+    if (splashWindow && !splashWindow.isDestroyed()) splashWindow.close();
+
 }
 
 app.whenReady().then(startup);
@@ -185,6 +304,7 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+    appQuitting = true;
     shutdown();
 });
 

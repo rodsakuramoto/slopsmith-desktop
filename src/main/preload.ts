@@ -3,6 +3,8 @@
 // window.slopsmithDesktop for audio engine and desktop features.
 
 const { contextBridge, ipcRenderer } = require('electron');
+import type { StartupStatus } from './python';
+import { IPC_STARTUP_STATUS, IPC_STARTUP_GET_STATUS, IPC_STARTUP_REQUEST_STATUS } from './ipc-channels';
 
 // Audio sync offset — set as a mutable property via the isolated world bridge.
 // The settings panel reads/writes localStorage and updates this at runtime.
@@ -120,4 +122,17 @@ contextBridge.exposeInMainWorld('slopsmithDesktop', {
     // App info
     getInfo: () => ipcRenderer.invoke('app:getInfo'),
     getConfigDir: () => ipcRenderer.invoke('app:getConfigDir'),
+
+    // Startup status
+    startup: {
+        getStatus: () => ipcRenderer.invoke(IPC_STARTUP_GET_STATUS),
+        onStatus: (callback: (status: StartupStatus) => void) => {
+            const listener = (_event: unknown, status: StartupStatus) => callback(status);
+            ipcRenderer.on(IPC_STARTUP_STATUS, listener);
+            ipcRenderer.send(IPC_STARTUP_REQUEST_STATUS);
+            return () => ipcRenderer.removeListener(IPC_STARTUP_STATUS, listener);
+        },
+    },
 });
+
+export {};
