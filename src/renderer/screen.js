@@ -224,8 +224,11 @@
         if (inputGainLabel) inputGainLabel.textContent = formatGainDbLabel(inDb);
         if (outputGainLabel) outputGainLabel.textContent = formatGainDbLabel(outDb);
 
-        api.setGain('input', inputLin);
-        api.setGain('output', outputLin);
+        // Round-trip through the clamped dB value so the engine sees the same gain
+        // the slider shows — prevents out-of-range preset values from bypassing the
+        // [-60, +12] dB clamp applied by linearGainToDb/dbToLinearGain.
+        api.setGain('input', dbToLinearGain(inDb));
+        api.setGain('output', dbToLinearGain(outDb));
     }
 
     // ── Device Types ──────────────────────────────────────────────────────────
@@ -2354,6 +2357,7 @@
         if (window._aeMarkSongTransition) window._aeMarkSongTransition(7000);
         if (_toneMonitor) { clearInterval(_toneMonitor); _toneMonitor = null; }
         window._toneAutoSwitchActive = false;
+        window._aeDidClearChainForNewSong = false;
         _lastTone = null;
         window._aeTaSessionOverrides = {};
         if (window._closeChainPanel) window._closeChainPanel();
@@ -2375,7 +2379,9 @@
         // the audio host during playSong and crash). The timed preload below rebuilds song presets.
         setTimeout(() => {
             if (window._aeClearChainForNewSong) {
-                void window._aeClearChainForNewSong().catch((e) => {
+                void window._aeClearChainForNewSong().then(() => {
+                    window._aeDidClearChainForNewSong = true;
+                }).catch((e) => {
                     console.warn('[audio-engine] clearChainForNewSong failed:', e);
                 });
             }
@@ -2421,10 +2427,11 @@
             } catch (e) { /* ignore */ }
             // MIDI PC mode talks to an existing VST slot — do not wipe the chain here (outer MIDI block
             // does not reload processors). Bypass / Tone Automation need a clean slate vs menu default.
-            // Also skip when _aeClearChainForNewSong already ran at 400ms to avoid a second clearChain
-            // call before preloadForSong (which calls clearChain itself) — double-clear risks a JUCE crash.
+            // Also skip when the 400ms clearChainForNewSong call already completed successfully — tracked
+            // via _aeDidClearChainForNewSong (set on resolution, cleared at each playSong start).
+            // Double-clearing risks a JUCE crash; preloadForSong calls clearChain again anyway.
             const skipPreflightClear = (midiPreflight?.mode === 'midi' && Number(midiPreflight.vstSlotId) >= 0)
-                || !!window._aeClearChainForNewSong;
+                || !!window._aeDidClearChainForNewSong;
             if (!skipPreflightClear) {
                 try {
                     await api.clearChain();
