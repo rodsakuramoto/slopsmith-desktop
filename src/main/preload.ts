@@ -3,6 +3,7 @@
 // window.slopsmithDesktop for audio engine and desktop features.
 
 const { contextBridge, ipcRenderer } = require('electron');
+import type { IpcRendererEvent } from 'electron';
 import type { StartupStatus } from './python';
 import {
     IPC_STARTUP_STATUS,
@@ -18,7 +19,7 @@ import {
 // surface — they have to forward it via window.postMessage so the main world
 // can grab it from the event's transferable list. The capture script in
 // audio-capture.ts listens for this message and starts streaming PCM.
-ipcRenderer.on(IPC_BACKING_STREAM_PORT, (event) => {
+ipcRenderer.on(IPC_BACKING_STREAM_PORT, (event: IpcRendererEvent) => {
     const port = event.ports[0];
     if (!port) return;
     window.postMessage({ slopsmithBackingStreamPort: true }, '*', [port]);
@@ -26,7 +27,7 @@ ipcRenderer.on(IPC_BACKING_STREAM_PORT, (event) => {
 
 // Forward routing-mode changes (exclusive on/off) into the page world too,
 // so the capture script can connect/disconnect from audioCtx.destination.
-ipcRenderer.on(IPC_BACKING_STREAM_ROUTING, (_event, payload: { active: boolean }) => {
+ipcRenderer.on(IPC_BACKING_STREAM_ROUTING, (_event: IpcRendererEvent, payload: { active: boolean }) => {
     window.postMessage({ slopsmithBackingStreamRouting: !!payload?.active }, '*');
 });
 
