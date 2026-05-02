@@ -846,6 +846,7 @@
     }
 
     window._aeGetPresets = getPresets;
+    window._aeApplyPresetGainLevels = applyPresetGainLevels;
     window._aeLoadDefaultPreset = loadDefaultPreset;
     window._aeReplaceChainWithPresetBlob = replaceChainWithPresetBlob;
 
@@ -864,10 +865,11 @@
         } catch (e) {
             console.warn('[audio-engine] persist empty chain:', e);
         }
-        try {
-            await refreshChain();
-        } catch (e) {
-            console.warn('[audio-engine] refreshChain after clear:', e);
+        // Do NOT call refreshChain() here — it calls api.getChainState() which can crash
+        // some JUCE bridges immediately after clearChain. Render the empty state directly.
+        const container = chainContainer || $('ae-chain');
+        if (container) {
+            container.innerHTML = '<div class="text-sm text-slate-500 italic">No processors loaded — add a VST, NAM model, or cabinet IR</div>';
         }
     }
     window._aeClearChainForNewSong = clearChainForNewSong;
@@ -2040,11 +2042,29 @@
             this.activeTone = null;
             this.activePreset = null;
             this.taSwitcher = true;
+            this._switchLock = null;  // in-flight Promise; null when idle
+            this._pendingTone = null; // latest request that arrived while locked (coalesced)
         }
         async switchToTone(name) {
             const input = String(name || '').trim();
             if (!input) return;
             this.activeTone = input;
+            if (this._switchLock) {
+                // A switch is already in progress — record latest request and let it drain.
+                this._pendingTone = input;
+                return;
+            }
+            // Drain: process the current request, then any coalesced pending one.
+            let current = input;
+            while (current) {
+                this._pendingTone = null;
+                this._switchLock = this._doSwitch(current);
+                await this._switchLock;
+                this._switchLock = null;
+                current = this._pendingTone;
+            }
+        }
+        async _doSwitch(input) {
             const cfg = readTaStore();
             const { effectiveName: presetName, autoName, category } = getTaSessionEffectivePreset(input, cfg);
             if (!presetName || presetName === this.activePreset) return;
@@ -2261,33 +2281,15 @@
         toast._timer = setTimeout(() => { toast.style.opacity = '0'; }, 2000);
     }
 
-    function applyPresetGainLevels(api, preset) {
+    // Delegate to the audio-API IIFE's implementation — avoids duplicate gain/UI logic drifting.
+    // The _api parameter is accepted for call-site compatibility but ignored when delegating;
+    // the first IIFE's version uses its own closure-scoped api (same underlying native object).
+    function applyPresetGainLevels(_api, preset) {
+        if (window._aeApplyPresetGainLevels) { window._aeApplyPresetGainLevels(preset); return; }
+        // Fallback when first IIFE hasn't loaded yet (should not happen in normal flow).
         const inputLin = Number.isFinite(Number(preset?.inputGain)) ? Number(preset.inputGain) : 1;
         const outputLin = Number.isFinite(Number(preset?.outputGain)) ? Number(preset.outputGain) : 1;
-
-        const inputSlider = document.getElementById('ae-input-gain');
-        const outputSlider = document.getElementById('ae-output-gain');
-        const inputLabel = document.getElementById('ae-input-gain-label');
-        const outputLabel = document.getElementById('ae-output-gain-label');
-
-        const linToDb = window._aeLinearGainToDb || ((l) => {
-            const x = Number(l);
-            if (!Number.isFinite(x) || x <= 0) return -60;
-            return Math.min(12, Math.max(-60, 20 * Math.log10(x)));
-        });
-        const fmt = window._aeFormatGainDbLabel || ((db) => `${Number(db).toFixed(1)} dB`);
-        const inDb = linToDb(inputLin);
-        const outDb = linToDb(outputLin);
-
-        if (inputSlider) inputSlider.value = String(inDb);
-        if (outputSlider) outputSlider.value = String(outDb);
-        if (inputLabel) inputLabel.textContent = fmt(inDb);
-        if (outputLabel) outputLabel.textContent = fmt(outDb);
-
-        if (api?.setGain) {
-            api.setGain('input', inputLin);
-            api.setGain('output', outputLin);
-        }
+        if (_api?.setGain) { _api.setGain('input', inputLin); _api.setGain('output', outputLin); }
     }
 
     function startToneAutoSwitch() {
