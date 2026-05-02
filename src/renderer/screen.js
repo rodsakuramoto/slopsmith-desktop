@@ -221,16 +221,19 @@
         const inDb = linearGainToDb(inputLin);
         const outDb = linearGainToDb(outputLin);
 
-        if (inputGainSlider) inputGainSlider.value = inDb.toFixed(1);
-        if (outputGainSlider) outputGainSlider.value = outDb.toFixed(1);
-        if (inputGainLabel) inputGainLabel.textContent = formatGainDbLabel(inDb);
-        if (outputGainLabel) outputGainLabel.textContent = formatGainDbLabel(outDb);
+        // Round to 0.1 dB before updating the UI and engine so they always agree.
+        const inDbR = parseFloat(inDb.toFixed(1));
+        const outDbR = parseFloat(outDb.toFixed(1));
+        if (inputGainSlider) inputGainSlider.value = inDbR;
+        if (outputGainSlider) outputGainSlider.value = outDbR;
+        if (inputGainLabel) inputGainLabel.textContent = formatGainDbLabel(inDbR);
+        if (outputGainLabel) outputGainLabel.textContent = formatGainDbLabel(outDbR);
 
         // Round-trip through the clamped dB value so the engine sees the same gain
         // the slider shows — prevents out-of-range preset values from bypassing the
         // [-60, +12] dB clamp applied by linearGainToDb/dbToLinearGain.
-        api.setGain('input', dbToLinearGain(inDb));
-        api.setGain('output', dbToLinearGain(outDb));
+        api.setGain('input', dbToLinearGain(inDbR));
+        api.setGain('output', dbToLinearGain(outDbR));
     }
 
     // ── Device Types ──────────────────────────────────────────────────────────
@@ -817,9 +820,9 @@
         try {
             await api.clearChain();
             const result = await api.loadPreset(preset.nativePreset);
-            // Some JUCE bridges return {success: false, error: '...'} instead of throwing.
-            if (result && result.success === false) {
-                console.error(tag + ': loadPreset failed:', result.error || 'unknown error');
+            // Some JUCE bridges return {success:false} or bare false instead of throwing.
+            if (result === false || (result && result.success === false)) {
+                console.error(tag + ': loadPreset failed:', result?.error || 'unknown error');
                 await _restorePresetBlob(snapshotBlob, tag);
                 if (!snapshotBlob) {
                     // No rollback available; chain is now empty — sync localStorage and UI to match.
@@ -857,9 +860,9 @@
         try {
             await api.clearChain();
             const result = await api.loadPreset(snapshotBlob);
-            // Some JUCE bridges return {success:false} instead of throwing.
-            if (result && result.success === false) {
-                console.warn((tag || '[audio-engine]') + ' snapshot rollback loadPreset failed:', result.error || 'unknown');
+            // Some JUCE bridges return {success:false} or bare false instead of throwing.
+            if (result === false || (result && result.success === false)) {
+                console.warn((tag || '[audio-engine]') + ' snapshot rollback loadPreset failed:', result?.error || 'unknown');
                 try { localStorage.setItem('slopsmith-signal-chain', '[]'); } catch (_) {}
                 _renderEmptyChain();
                 return;
