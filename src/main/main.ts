@@ -3,9 +3,10 @@
 
 import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron';
 import * as path from 'path';
+import * as fs from 'fs';
 import { startPython, stopPython, waitForPython, getPythonPort, getStartupStatus, StartupStatus } from './python';
 import { IPC_STARTUP_STATUS, IPC_STARTUP_GET_STATUS, IPC_STARTUP_REQUEST_STATUS } from './ipc-channels';
-import { initAudioBridge, shutdownAudio } from './audio-bridge';
+import { initAudioBridge, shutdownAudio, attachBackingStreamPort } from './audio-bridge';
 import { initPluginManager } from './plugin-manager';
 import { initSoundfontManager } from './soundfont-manager';
 
@@ -169,6 +170,13 @@ function createWindow(port: number): void {
         mainWindow?.webContents.executeJavaScript(`
             window._slopsmithSyncOffset = parseFloat(localStorage.getItem('slopsmith-sync-offset') || '0.2');
         `).catch(() => {});
+
+        // Windows internal-routing fix: inject the backing-track capture
+        // script into the page and hand it a MessagePort. macOS / Linux skip
+        // this entirely — their audio routing already works without it.
+        if (process.platform === 'win32' && mainWindow) {
+            installBackingCapture(mainWindow);
+        }
     });
 
     // Open external links in system browser
@@ -314,6 +322,44 @@ function shutdown(): void {
     } catch { /* console may already be gone mid-teardown */ }
     shutdownAudio();
     stopPython();
+}
+
+// ── Internal audio routing (Windows-only) ────────────────────────────────────
+//
+// Reads the compiled audio-capture.js from disk (sibling of main.js) and
+// executes it in the main world of the slopsmith webapp. The script wires
+// the backing-track <audio> element through a Web Audio AudioWorklet that
+// posts PCM frames over a MessagePort to the audio bridge. Once the script
+// is in place, attachBackingStreamPort hands it the port.
+function installBackingCapture(window: BrowserWindow): void {
+    if (process.platform !== 'win32') return;
+    const captureJsPath = path.join(__dirname, 'audio-capture.js');
+    let source: string;
+    try {
+        source = fs.readFileSync(captureJsPath, 'utf-8');
+    } catch (err: any) {
+        console.warn(`[main] audio-capture.js missing at ${captureJsPath}: ${err?.message ?? err}`);
+        return;
+    }
+    // Wrap in IIFE + idempotency guard so re-loads (page reload, redirects)
+    // don't end up with multiple worklets fighting over the <audio> element.
+    const wrapped = `
+        (function(){
+            if (window.__slopsmithBackingCaptureInstalled) return;
+            window.__slopsmithBackingCaptureInstalled = true;
+            try { ${source} } catch (e) {
+                console.error('[slopsmith] backing-capture install failed:', e);
+                window.__slopsmithBackingCaptureInstalled = false;
+            }
+        })();
+    `;
+    window.webContents.executeJavaScript(wrapped, true)
+        .then(() => {
+            attachBackingStreamPort(window);
+        })
+        .catch((err) => {
+            console.warn(`[main] failed to inject audio-capture.js: ${err?.message ?? err}`);
+        });
 }
 
 // macOS: re-create window when dock icon is clicked

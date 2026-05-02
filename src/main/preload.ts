@@ -4,7 +4,31 @@
 
 const { contextBridge, ipcRenderer } = require('electron');
 import type { StartupStatus } from './python';
-import { IPC_STARTUP_STATUS, IPC_STARTUP_GET_STATUS, IPC_STARTUP_REQUEST_STATUS } from './ipc-channels';
+import {
+    IPC_STARTUP_STATUS,
+    IPC_STARTUP_GET_STATUS,
+    IPC_STARTUP_REQUEST_STATUS,
+    IPC_BACKING_STREAM_PORT,
+    IPC_BACKING_STREAM_ROUTING,
+} from './ipc-channels';
+
+// Internal audio routing (Windows-only): the main process sends a transferable
+// MessagePort whenever the backing-track capture script needs one (typically
+// once per page load). Preload scripts can't put the port on a contextBridge
+// surface — they have to forward it via window.postMessage so the main world
+// can grab it from the event's transferable list. The capture script in
+// audio-capture.ts listens for this message and starts streaming PCM.
+ipcRenderer.on(IPC_BACKING_STREAM_PORT, (event) => {
+    const port = event.ports[0];
+    if (!port) return;
+    window.postMessage({ slopsmithBackingStreamPort: true }, '*', [port]);
+});
+
+// Forward routing-mode changes (exclusive on/off) into the page world too,
+// so the capture script can connect/disconnect from audioCtx.destination.
+ipcRenderer.on(IPC_BACKING_STREAM_ROUTING, (_event, payload: { active: boolean }) => {
+    window.postMessage({ slopsmithBackingStreamRouting: !!payload?.active }, '*');
+});
 
 // Audio sync offset — set as a mutable property via the isolated world bridge.
 // The settings panel reads/writes localStorage and updates this at runtime.
@@ -87,6 +111,19 @@ contextBridge.exposeInMainWorld('slopsmithDesktop', {
         // Tone switching
         setMultiBypass: (changes: Array<{slotId: number, bypassed: boolean}>) =>
             ipcRenderer.invoke('audio:setMultiBypass', changes),
+
+        // Internal audio routing (Windows-only fix for exclusive-mode lockout).
+        // The renderer captures <audio id="audio"> via Web Audio and streams
+        // PCM to the C++ engine; these methods control / observe that path.
+        backingStream: {
+            setEnabled: (enabled: boolean) =>
+                ipcRenderer.invoke('audio:setBackingStreamEnabled', enabled),
+            isEnabled: () => ipcRenderer.invoke('audio:isBackingStreamEnabled'),
+            reset: () => ipcRenderer.invoke('audio:resetBackingStream'),
+            getStats: () => ipcRenderer.invoke('audio:getBackingStreamStats'),
+            isCurrentDeviceExclusive: () =>
+                ipcRenderer.invoke('audio:isCurrentDeviceExclusive'),
+        },
     },
 
     // Plugin management

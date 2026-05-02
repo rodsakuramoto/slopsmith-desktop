@@ -5,6 +5,7 @@ set(AUDIO_SOURCES
     NodeAddon.cpp
     AudioEngine.cpp
     SignalChain.cpp
+    StreamedBackingBuffer.cpp
     VSTHost.cpp
     NAMProcessor.cpp
     IRLoader.cpp
@@ -82,8 +83,16 @@ if(APPLE)
         "-framework Accelerate"
     )
 elseif(WIN32)
+    # WASAPI is on by default in JUCE on Windows but we set it explicitly so
+    # the exclusive-mode device type ("Windows Audio (Exclusive Mode)") is
+    # registered alongside the default shared "Windows Audio" type. Users can
+    # then pick exclusive mode from the device-type dropdown; the streamed
+    # backing-track path (StreamedBackingBuffer) kicks in automatically when
+    # an exclusive type is selected — see AudioEngine::audioDeviceAboutToStart.
     target_compile_definitions(slopsmith_audio PRIVATE
         JUCE_ASIO=1
+        JUCE_WASAPI=1
+        JUCE_WASAPI_EXCLUSIVE=1
     )
     # Enable /EHa so catch(...) also catches SEH exceptions (ASIO driver crashes)
     if(MSVC)

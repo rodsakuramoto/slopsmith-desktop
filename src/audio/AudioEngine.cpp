@@ -362,6 +362,43 @@ double AudioEngine::getBackingPosition() const
     return 0.0;
 }
 
+// ── Streamed Backing Track ───────────────────────────────────────────────────
+
+int AudioEngine::pushBackingStream(const float* interleaved,
+                                   int numChannels,
+                                   int numFrames,
+                                   double sampleRate)
+{
+    return streamBuffer.pushInterleaved(interleaved, numChannels, numFrames, sampleRate);
+}
+
+void AudioEngine::setBackingStreamEnabled(bool enabled)
+{
+    const bool was = useStreamedBacking.exchange(enabled);
+    if (was != enabled)
+    {
+        // Reset on every transition. Pulls the file-based transport's gain
+        // safely down to zero on the next callback (fade is handled by the
+        // ScopedTryLock branch in the audio callback) and clears any stale
+        // PCM that accumulated while disabled.
+        streamBuffer.reset();
+        fprintf(stderr, "[AudioEngine] Streamed backing routing %s\n",
+                enabled ? "ENABLED" : "DISABLED");
+    }
+}
+
+bool AudioEngine::isCurrentDeviceExclusive() const
+{
+#if JUCE_WINDOWS
+    if (auto* type = deviceManager.getCurrentDeviceTypeObject())
+    {
+        const auto name = type->getTypeName();
+        return name == "ASIO" || name == "Windows Audio (Exclusive Mode)";
+    }
+#endif
+    return false;
+}
+
 void AudioEngine::resetPeaks()
 {
     inputPeak.store(0.0f);
@@ -377,6 +414,7 @@ void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
 
     signalChain.prepare(currentSampleRate, currentBlockSize);
     pitchDetector.prepare(currentSampleRate, currentBlockSize);
+    streamBuffer.prepare(currentSampleRate, currentBlockSize);
 
     const juce::ScopedLock sl(backingLock);
     if (backingTransport)
@@ -444,7 +482,21 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     if (monitorMuted.load() && !hasProcessors)
         buffer.clear();
 
-    // Mix backing track
+    // Mix backing track. On Windows, when the renderer has handed the audio
+    // off to us (because exclusive mode is locking the OS mixer out), pull
+    // resampled PCM from the streamed ring buffer instead of the file-based
+    // transport. Exactly one path runs per callback; the other is a no-op.
+    const float bVol = backingVolume.load();
+    bool streamActive = false;
+#if JUCE_WINDOWS
+    streamActive = useStreamedBacking.load();
+    if (streamActive)
+    {
+        streamBuffer.pullAndAddTo(buffer, 0, numSamples, bVol);
+    }
+#endif
+
+    if (! streamActive)
     {
         const juce::ScopedTryLock sl(backingLock);
         if (sl.isLocked() && backingTransport && backingPlaying.load())
@@ -454,7 +506,6 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
             juce::AudioSourceChannelInfo info(&backingBuffer, 0, numSamples);
             backingTransport->getNextAudioBlock(info);
 
-            float bVol = backingVolume.load();
             for (int ch = 0; ch < numOutputChannels; ++ch)
                 buffer.addFrom(ch, 0, backingBuffer,
                                juce::jmin(ch, backingBuffer.getNumChannels() - 1),

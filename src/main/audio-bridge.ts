@@ -2,13 +2,16 @@
 // The native addon is loaded via require() and its methods are
 // exposed to the renderer process via ipcMain.handle().
 
-import { ipcMain, BrowserWindow } from 'electron';
+import { ipcMain, BrowserWindow, MessageChannelMain, MessagePortMain } from 'electron';
 import * as path from 'path';
 import { app } from 'electron';
+import { IPC_BACKING_STREAM_PORT, IPC_BACKING_STREAM_ROUTING } from './ipc-channels';
 
 type AudioModule = Record<string, (...args: any[]) => any>;
 
 let audio: AudioModule | null = null;
+let backingStreamPort: MessagePortMain | null = null;
+let lastRoutingActive = false;
 
 function loadNativeAddon(): AudioModule | null {
     const addonPaths = [
@@ -79,11 +82,15 @@ export function initAudioBridge(mainWindow: BrowserWindow | null): void {
     });
 
     ipcMain.handle('audio:setDeviceType', (_event, typeName: string) => {
-        return audio?.setDeviceType(typeName) ?? false;
+        const result = audio?.setDeviceType(typeName) ?? false;
+        if (result) reevaluateInternalRouting(mainWindow);
+        return result;
     });
 
     ipcMain.handle('audio:setDevice', (_event, input: string, output: string, sampleRate: number, bufferSize: number) => {
-        return audio?.setDevice(input, output, sampleRate, bufferSize) ?? false;
+        const result = audio?.setDevice(input, output, sampleRate, bufferSize) ?? false;
+        if (result) reevaluateInternalRouting(mainWindow);
+        return result;
     });
 
     // ── Audio Control ──────────────────────────────────────────────────────
@@ -236,9 +243,111 @@ export function initAudioBridge(mainWindow: BrowserWindow | null): void {
     ipcMain.handle('audio:setMultiBypass', (_event, changes: Array<{slotId: number, bypassed: boolean}>) => {
         return audio?.setMultiBypass(changes) ?? false;
     });
+
+    // ── Internal Audio Routing (Windows exclusive-mode fix) ────────────────
+    //
+    // Renderer-side capture (AudioWorklet on the slopsmith <audio> element)
+    // streams interleaved Float32 PCM here over a MessagePort, where we hand
+    // it directly to the native addon's lock-free ring buffer. The C++ audio
+    // callback then mixes it alongside the processed guitar signal into the
+    // single exclusive output stream. Non-Windows callers can still flip the
+    // routing flag, but the C++ mixdown branch only compiles in on _WIN32 so
+    // this is effectively a no-op there.
+    //
+    // The MessagePort handshake itself is initiated from main.ts after the
+    // page finishes loading (so a MessageChannelMain is wired up to the
+    // renderer's main-world capture script via the preload bridge).
+
+    ipcMain.handle('audio:setBackingStreamEnabled', (_event, enabled: boolean) => {
+        if (audio) audio.setBackingStreamEnabled(!!enabled);
+        notifyRoutingChanged(mainWindow, !!enabled);
+    });
+
+    ipcMain.handle('audio:isBackingStreamEnabled', () => {
+        return audio?.isBackingStreamEnabled() ?? false;
+    });
+
+    ipcMain.handle('audio:resetBackingStream', () => {
+        audio?.resetBackingStream();
+    });
+
+    ipcMain.handle('audio:getBackingStreamStats', () => {
+        return audio?.getBackingStreamStats() ?? {
+            enabled: false, underruns: 0, fillFraction: 0, exclusive: false,
+        };
+    });
+
+    ipcMain.handle('audio:isCurrentDeviceExclusive', () => {
+        return audio?.isCurrentDeviceExclusive() ?? false;
+    });
+}
+
+// ── MessagePort handshake (called from main.ts on did-finish-load) ──────────
+
+export function attachBackingStreamPort(window: BrowserWindow): void {
+    if (process.platform !== 'win32') {
+        // Non-Windows builds skip the entire capture path. macOS / Linux fall
+        // back to JUCE's existing behavior — backing audio plays through the
+        // OS mixer, which on those platforms shares the device fine.
+        return;
+    }
+    if (!audio) return;
+
+    // Tear down any prior port (page reload, window recreate). The previous
+    // port was scoped to the previous renderer; we always want a fresh pair.
+    if (backingStreamPort) {
+        try { backingStreamPort.close(); } catch { /* already gone */ }
+        backingStreamPort = null;
+    }
+
+    const channel = new MessageChannelMain();
+    backingStreamPort = channel.port1;
+
+    backingStreamPort.on('message', (event) => {
+        const msg = event.data;
+        if (!msg || !audio) return;
+        const { buf, ch, frames, sr } = msg as {
+            buf: ArrayBuffer; ch: number; frames: number; sr: number;
+        };
+        if (!buf) return;
+        // Float32 PCM is sent transferable so this is a zero-copy view.
+        const floats = new Float32Array(buf);
+        try {
+            audio.pushBackingStream(floats, ch, frames, sr);
+        } catch (e: any) {
+            console.warn(`[audio] pushBackingStream threw: ${e?.message ?? e}`);
+        }
+    });
+    backingStreamPort.start();
+
+    window.webContents.postMessage(IPC_BACKING_STREAM_PORT, null, [channel.port2]);
+
+    // Re-evaluate routing now that the renderer is ready to receive the
+    // routing-changed event.
+    reevaluateInternalRouting(window);
+}
+
+function reevaluateInternalRouting(window: BrowserWindow | null): void {
+    if (process.platform !== 'win32' || !audio) return;
+    const exclusive: boolean = !!audio.isCurrentDeviceExclusive();
+    if (exclusive !== lastRoutingActive) {
+        audio.setBackingStreamEnabled(exclusive);
+    }
+    notifyRoutingChanged(window, exclusive);
+}
+
+function notifyRoutingChanged(window: BrowserWindow | null, active: boolean): void {
+    lastRoutingActive = active;
+    if (window && !window.isDestroyed()) {
+        window.webContents.send(IPC_BACKING_STREAM_ROUTING, { active });
+    }
 }
 
 export function shutdownAudio(): void {
+    if (backingStreamPort) {
+        try { backingStreamPort.close(); } catch { /* already gone */ }
+        backingStreamPort = null;
+    }
     if (audio) {
         try {
             audio.shutdown();

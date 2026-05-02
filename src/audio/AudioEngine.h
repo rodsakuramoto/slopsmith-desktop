@@ -1,6 +1,7 @@
 #pragma once
 #include "SignalChain.h"
 #include "PitchDetector.h"
+#include "StreamedBackingBuffer.h"
 #include <juce_audio_devices/juce_audio_devices.h>
 #include <juce_audio_formats/juce_audio_formats.h>
 
@@ -65,6 +66,32 @@ public:
     bool isBackingPlaying() const { return backingPlaying.load(); }
     double getBackingPosition() const;
 
+    // ── Streamed Backing Track (Windows internal-routing fix) ────────────────
+    // When an exclusive audio device is selected (ASIO / WASAPI Exclusive)
+    // on Windows, the OS mixer is locked out, so the renderer's <audio>
+    // playback is silenced. The renderer instead taps the element via
+    // Web Audio + AudioWorklet and streams Float32 PCM here; the audio
+    // callback mixes it alongside the processed guitar signal.
+    //
+    // These methods are no-ops on macOS / Linux — they're safe to call but
+    // setBackingStreamEnabled(true) won't actually divert the signal flow,
+    // because the platform-gated mixdown branch in the audio callback only
+    // compiles in on _WIN32.
+    int  pushBackingStream(const float* interleaved,
+                           int numChannels,
+                           int numFrames,
+                           double sampleRate);
+    void setBackingStreamEnabled(bool enabled);
+    bool isBackingStreamEnabled() const { return useStreamedBacking.load(); }
+    void resetBackingStream() { streamBuffer.reset(); }
+    int   getBackingStreamUnderruns() const { return streamBuffer.getUnderrunCount(); }
+    float getBackingStreamFill()      const { return streamBuffer.getFillFraction(); }
+
+    // Returns true if the active device type is one where the OS mixer is
+    // locked out (ASIO or WASAPI Exclusive on Windows). Callers in the main
+    // process use this to flip the renderer-side routing mode.
+    bool isCurrentDeviceExclusive() const;
+
     // Metering (read from any thread — atomic)
     float getInputLevel() const { return currentInputLevel.load(); }
     float getOutputLevel() const { return currentOutputLevel.load(); }
@@ -106,6 +133,10 @@ private:
     juce::AudioBuffer<float> backingBuffer;
     std::atomic<bool> backingPlaying{false};
     juce::CriticalSection backingLock;
+
+    // Streamed backing-track path (Windows-only mixdown — see header above).
+    StreamedBackingBuffer streamBuffer;
+    std::atomic<bool> useStreamedBacking { false };
 
     bool audioRunning = false;
     double currentSampleRate = 48000.0;

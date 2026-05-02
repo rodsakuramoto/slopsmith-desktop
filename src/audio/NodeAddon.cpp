@@ -845,6 +845,89 @@ static Napi::Value SeekBacking(const Napi::CallbackInfo& info)
     return info.Env().Undefined();
 }
 
+// ── Streamed Backing (Windows internal-routing fix) ──────────────────────────
+// Hot-path entry point: called from the audio bridge with each interleaved
+// Float32 PCM packet from the renderer's AudioWorklet. No thread-hops, no
+// JUCE message-thread dispatch — the StreamedBackingBuffer's push side is
+// lock-free against the audio thread.
+
+static Napi::Value PushBackingStream(const Napi::CallbackInfo& info)
+{
+    auto env = info.Env();
+    if (!engine || info.Length() < 4)
+        return Napi::Number::New(env, 0);
+
+    if (!info[0].IsTypedArray())
+        return Napi::Number::New(env, 0);
+
+    auto typed = info[0].As<Napi::TypedArray>();
+    if (typed.TypedArrayType() != napi_float32_array)
+        return Napi::Number::New(env, 0);
+
+    auto floats = typed.As<Napi::Float32Array>();
+    const float* data = floats.Data();
+    const size_t totalSamples = floats.ElementLength();
+
+    int channels   = info[1].As<Napi::Number>().Int32Value();
+    int frames     = info[2].As<Napi::Number>().Int32Value();
+    double srcRate = info[3].As<Napi::Number>().DoubleValue();
+
+    if (channels <= 0 || frames <= 0 || srcRate <= 0.0)
+        return Napi::Number::New(env, 0);
+
+    // Defend against malformed input — a renderer bug shouldn't be able to
+    // walk us off the end of the typed array.
+    if ((size_t)(channels * frames) > totalSamples)
+        frames = (int)(totalSamples / (size_t)channels);
+
+    int accepted = engine->pushBackingStream(data, channels, frames, srcRate);
+    return Napi::Number::New(env, accepted);
+}
+
+static Napi::Value SetBackingStreamEnabled(const Napi::CallbackInfo& info)
+{
+    if (engine && info.Length() > 0)
+        engine->setBackingStreamEnabled(info[0].As<Napi::Boolean>().Value());
+    return info.Env().Undefined();
+}
+
+static Napi::Value IsBackingStreamEnabled(const Napi::CallbackInfo& info)
+{
+    return Napi::Boolean::New(info.Env(), engine ? engine->isBackingStreamEnabled() : false);
+}
+
+static Napi::Value ResetBackingStream(const Napi::CallbackInfo& info)
+{
+    if (engine) engine->resetBackingStream();
+    return info.Env().Undefined();
+}
+
+static Napi::Value GetBackingStreamStats(const Napi::CallbackInfo& info)
+{
+    auto env = info.Env();
+    auto obj = Napi::Object::New(env);
+    if (engine)
+    {
+        obj.Set("enabled",     engine->isBackingStreamEnabled());
+        obj.Set("underruns",   engine->getBackingStreamUnderruns());
+        obj.Set("fillFraction", engine->getBackingStreamFill());
+        obj.Set("exclusive",   engine->isCurrentDeviceExclusive());
+    }
+    else
+    {
+        obj.Set("enabled",     false);
+        obj.Set("underruns",   0);
+        obj.Set("fillFraction", 0.0);
+        obj.Set("exclusive",   false);
+    }
+    return obj;
+}
+
+static Napi::Value IsCurrentDeviceExclusive(const Napi::CallbackInfo& info)
+{
+    return Napi::Boolean::New(info.Env(), engine ? engine->isCurrentDeviceExclusive() : false);
+}
+
 // ── Presets ───────────────────────────────────────────────────────────────────
 
 static Napi::Value SavePreset(const Napi::CallbackInfo& info)
@@ -1076,6 +1159,14 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports)
     exports.Set("startBacking", Napi::Function::New(env, StartBacking));
     exports.Set("stopBacking", Napi::Function::New(env, StopBacking));
     exports.Set("seekBacking", Napi::Function::New(env, SeekBacking));
+
+    // Streamed backing (Windows internal-routing fix)
+    exports.Set("pushBackingStream",       Napi::Function::New(env, PushBackingStream));
+    exports.Set("setBackingStreamEnabled", Napi::Function::New(env, SetBackingStreamEnabled));
+    exports.Set("isBackingStreamEnabled",  Napi::Function::New(env, IsBackingStreamEnabled));
+    exports.Set("resetBackingStream",      Napi::Function::New(env, ResetBackingStream));
+    exports.Set("getBackingStreamStats",   Napi::Function::New(env, GetBackingStreamStats));
+    exports.Set("isCurrentDeviceExclusive", Napi::Function::New(env, IsCurrentDeviceExclusive));
 
     // Presets
     exports.Set("savePreset", Napi::Function::New(env, SavePreset));
