@@ -591,9 +591,6 @@
                 const presets = getPresets();
                 presets[name] = { nativePreset, items, ...gains, created: Date.now() };
                 localStorage.setItem('slopsmith-chain-presets', JSON.stringify(presets));
-                if (!localStorage.getItem('slopsmith-default-preset-name')) {
-                    localStorage.setItem('slopsmith-default-preset-name', name);
-                }
                 wrapper.remove();
                 renderPresetList();
                 renderToneAutomationTargets();
@@ -879,9 +876,8 @@
             return false;
         }
         const presets = getPresets();
-        // Use getDefaultPresetName (not ensureDefaultPresetName) so we only load when the user
-        // has *explicitly* configured a default — ensureDefaultPresetName auto-promotes the first
-        // preset, which would silently replace a freshly restored chain on every startup.
+        // Only load when the user has explicitly set a default preset via the Default button.
+        // Saving a preset no longer auto-promotes it, so this is always intentional.
         const defaultName = getDefaultPresetName();
         if (!defaultName || !presets[defaultName]) return false;
         const preset = presets[defaultName];
@@ -2065,6 +2061,7 @@
         if (_taRegexCache.has(cacheKey)) return _taRegexCache.get(cacheKey);
         const escaped = cleaned.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
         const re = new RegExp(`(?:^|[^a-z0-9])(?:${escaped.join('|')})`, 'i');
+        if (_taRegexCache.size >= 50) _taRegexCache.delete(_taRegexCache.keys().next().value);
         _taRegexCache.set(cacheKey, re);
         return re;
     }
