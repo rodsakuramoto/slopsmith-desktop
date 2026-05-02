@@ -219,8 +219,8 @@
         const inDb = linearGainToDb(inputLin);
         const outDb = linearGainToDb(outputLin);
 
-        if (inputGainSlider) inputGainSlider.value = String(inDb);
-        if (outputGainSlider) outputGainSlider.value = String(outDb);
+        if (inputGainSlider) inputGainSlider.value = inDb.toFixed(1);
+        if (outputGainSlider) outputGainSlider.value = outDb.toFixed(1);
         if (inputGainLabel) inputGainLabel.textContent = formatGainDbLabel(inDb);
         if (outputGainLabel) outputGainLabel.textContent = formatGainDbLabel(outDb);
 
@@ -978,7 +978,12 @@
 
             if (toneNames.size === 0) {
                 console.warn('[tone-switcher] preloadForSong: no valid tone names; chain cleared only');
-                await refreshChain();
+                // Do NOT call refreshChain() — it calls api.getChainState() which can crash some
+                // JUCE bridges immediately after clearChain. Render empty state directly instead.
+                const container = chainContainer || $('ae-chain');
+                if (container) {
+                    container.innerHTML = '<div class="text-sm text-slate-500 italic">No processors loaded — add a VST, NAM model, or cabinet IR</div>';
+                }
                 return;
             }
 
@@ -1495,7 +1500,7 @@
                     <span class="text-sm font-semibold text-slate-200">Tone Switching</span>
                     <button type="button" onclick="window._closeChainPanel && window._closeChainPanel()" class="text-slate-500 hover:text-white text-lg leading-none">&times;</button>
                 </div>
-                <div class="text-xs text-red-400">Failed to load: ${(err && err.message) || 'unknown error'}</div>`;
+                <div class="text-xs text-red-400">Failed to load: ${escHtml((err && err.message) || 'unknown error')}</div>`;
             }
             return;
         }
@@ -1874,7 +1879,7 @@
                     <span class="text-sm font-semibold text-slate-200">Tone Switching</span>
                     <button type="button" onclick="window._closeChainPanel && window._closeChainPanel()" class="text-slate-500 hover:text-white text-lg leading-none">&times;</button>
                 </div>
-                <div class="text-xs text-red-400">Failed to load: ${(err && err.message) || 'unknown error'}</div>`;
+                <div class="text-xs text-red-400">Failed to load: ${escHtml((err && err.message) || 'unknown error')}</div>`;
             }
         }
     }
@@ -1962,15 +1967,22 @@
     /** Builds a case-insensitive regex that matches any keyword anchored at a
      *  left word boundary (start of string or non-alphanumeric). The right side
      *  stays open so 'dist' matches 'distortion' and 'mod' matches 'modulator'.
-     *  Longer keywords are tried first so 'distortion' wins over 'dist'. */
+     *  Longer keywords are tried first so 'distortion' wins over 'dist'.
+     *  Results are memoized so callers on a tight interval (e.g. 200ms label update)
+     *  don't re-compile identical regexes on every tick. */
+    const _taRegexCache = new Map();
     function buildTaKeywordRegex(keywords) {
         const cleaned = (keywords || [])
             .map(k => String(k || '').trim().toLowerCase())
             .filter(Boolean);
         if (cleaned.length === 0) return null;
         cleaned.sort((a, b) => b.length - a.length);
+        const cacheKey = cleaned.join('\x00');
+        if (_taRegexCache.has(cacheKey)) return _taRegexCache.get(cacheKey);
         const escaped = cleaned.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-        return new RegExp(`(?:^|[^a-z0-9])(?:${escaped.join('|')})`, 'i');
+        const re = new RegExp(`(?:^|[^a-z0-9])(?:${escaped.join('|')})`, 'i');
+        _taRegexCache.set(cacheKey, re);
+        return re;
     }
 
     function classifyTaCategory(input, cfg) {
@@ -2401,7 +2413,10 @@
             } catch (e) { /* ignore */ }
             // MIDI PC mode talks to an existing VST slot — do not wipe the chain here (outer MIDI block
             // does not reload processors). Bypass / Tone Automation need a clean slate vs menu default.
-            const skipPreflightClear = midiPreflight?.mode === 'midi' && Number(midiPreflight.vstSlotId) >= 0;
+            // Also skip when _aeClearChainForNewSong already ran at 400ms to avoid a second clearChain
+            // call before preloadForSong (which calls clearChain itself) — double-clear risks a JUCE crash.
+            const skipPreflightClear = (midiPreflight?.mode === 'midi' && Number(midiPreflight.vstSlotId) >= 0)
+                || !!window._aeClearChainForNewSong;
             if (!skipPreflightClear) {
                 try {
                     await api.clearChain();
