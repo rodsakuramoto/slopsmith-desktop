@@ -13,6 +13,13 @@ let audio: AudioModule | null = null;
 let backingStreamPort: MessagePortMain | null = null;
 let lastRoutingActive = false;
 
+/** Main BrowserWindow ref — updated after createWindow(). Do not capture null from initAudioBridge at startup. */
+let audioBridgeMainWindow: BrowserWindow | null = null;
+
+export function registerAudioBridgeMainWindow(win: BrowserWindow | null): void {
+    audioBridgeMainWindow = win && !win.isDestroyed() ? win : null;
+}
+
 function loadNativeAddon(): AudioModule | null {
     const addonPaths = [
         // Development build
@@ -38,7 +45,7 @@ function loadNativeAddon(): AudioModule | null {
     return null;
 }
 
-export function initAudioBridge(mainWindow: BrowserWindow | null): void {
+export function initAudioBridge(): void {
     audio = loadNativeAddon();
 
     if (audio) {
@@ -83,13 +90,13 @@ export function initAudioBridge(mainWindow: BrowserWindow | null): void {
 
     ipcMain.handle('audio:setDeviceType', (_event, typeName: string) => {
         const result = audio?.setDeviceType(typeName) ?? false;
-        if (result) reevaluateInternalRouting(mainWindow);
+        if (result) reevaluateInternalRouting();
         return result;
     });
 
     ipcMain.handle('audio:setDevice', (_event, input: string, output: string, sampleRate: number, bufferSize: number) => {
         const result = audio?.setDevice(input, output, sampleRate, bufferSize) ?? false;
-        if (result) reevaluateInternalRouting(mainWindow);
+        if (result) reevaluateInternalRouting();
         return result;
     });
 
@@ -260,7 +267,7 @@ export function initAudioBridge(mainWindow: BrowserWindow | null): void {
 
     ipcMain.handle('audio:setBackingStreamEnabled', (_event, enabled: boolean) => {
         if (audio) audio.setBackingStreamEnabled(!!enabled);
-        notifyRoutingChanged(mainWindow, !!enabled);
+        notifyRoutingChanged(!!enabled);
     });
 
     ipcMain.handle('audio:isBackingStreamEnabled', () => {
@@ -322,28 +329,31 @@ export function attachBackingStreamPort(window: BrowserWindow): void {
 
     window.webContents.postMessage(IPC_BACKING_STREAM_PORT, null, [channel.port2]);
 
+    registerAudioBridgeMainWindow(window);
     // Re-evaluate routing now that the renderer is ready to receive the
     // routing-changed event.
-    reevaluateInternalRouting(window);
+    reevaluateInternalRouting();
 }
 
-function reevaluateInternalRouting(window: BrowserWindow | null): void {
+function reevaluateInternalRouting(): void {
     if (process.platform !== 'win32' || !audio) return;
     const exclusive: boolean = !!audio.isCurrentDeviceExclusive();
     if (exclusive !== lastRoutingActive) {
         audio.setBackingStreamEnabled(exclusive);
     }
-    notifyRoutingChanged(window, exclusive);
+    notifyRoutingChanged(exclusive);
 }
 
-function notifyRoutingChanged(window: BrowserWindow | null, active: boolean): void {
+function notifyRoutingChanged(active: boolean): void {
     lastRoutingActive = active;
-    if (window && !window.isDestroyed()) {
-        window.webContents.send(IPC_BACKING_STREAM_ROUTING, { active });
+    const win = audioBridgeMainWindow;
+    if (win && !win.isDestroyed()) {
+        win.webContents.send(IPC_BACKING_STREAM_ROUTING, { active });
     }
 }
 
 export function shutdownAudio(): void {
+    registerAudioBridgeMainWindow(null);
     if (backingStreamPort) {
         try { backingStreamPort.close(); } catch { /* already gone */ }
         backingStreamPort = null;

@@ -6,7 +6,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { startPython, stopPython, waitForPython, getPythonPort, getStartupStatus, StartupStatus } from './python';
 import { IPC_STARTUP_STATUS, IPC_STARTUP_GET_STATUS, IPC_STARTUP_REQUEST_STATUS } from './ipc-channels';
-import { initAudioBridge, shutdownAudio, attachBackingStreamPort } from './audio-bridge';
+import { initAudioBridge, shutdownAudio, attachBackingStreamPort, registerAudioBridgeMainWindow } from './audio-bridge';
 import { initPluginManager } from './plugin-manager';
 import { initSoundfontManager } from './soundfont-manager';
 
@@ -118,6 +118,8 @@ function createWindow(port: number): void {
         },
     });
 
+    registerAudioBridgeMainWindow(mainWindow);
+
     // Forward renderer console to main process stdout
     mainWindow.webContents.on('console-message', (_event, level, message, line, sourceId) => {
         const prefix = ['[renderer:verbose]', '[renderer:info]', '[renderer:warn]', '[renderer:error]'][level] || '[renderer]';
@@ -186,6 +188,7 @@ function createWindow(port: number): void {
     });
 
     mainWindow.on('closed', () => {
+        registerAudioBridgeMainWindow(null);
         mainWindow = null;
     });
 
@@ -212,7 +215,7 @@ async function startup(): Promise<void> {
     startPython();
 
     // Initialize audio engine (JUCE native addon)
-    initAudioBridge(mainWindow);
+    initAudioBridge();
 
     // Initialize plugin manager IPC handlers
     initPluginManager();
