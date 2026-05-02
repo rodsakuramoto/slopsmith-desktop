@@ -69,7 +69,8 @@
         const x = Number(db);
         if (!Number.isFinite(x)) return 1;
         const clamped = Math.min(GAIN_SLIDER_DB_MAX, Math.max(GAIN_SLIDER_DB_MIN, x));
-        if (clamped <= GAIN_SLIDER_DB_MIN) return 0;
+        // Always convert via the formula — returning 0 at GAIN_SLIDER_DB_MIN (-60 dB) would
+        // produce a true mute instead of the ~0.001 linear gain that -60 dB represents.
         return Math.pow(10, clamped / 20);
     }
 
@@ -154,11 +155,17 @@
             }
         }
 
-        // Skip restoring the saved chain when a default preset is configured — the
-        // preset will replace the chain immediately, making the restore redundant load/unload work.
-        const _defaultPresetName = getDefaultPresetName();
-        const _hasDefaultPreset = !!(_defaultPresetName && getPresets()[_defaultPresetName]);
-        if (!_hasDefaultPreset) {
+        // Try the default preset first; only restore the saved chain if no default preset is
+        // configured or the preset load fails (corrupted blob, missing VST, etc.). This avoids
+        // redundant native load/unload when the preset immediately replaces the chain, while
+        // ensuring a valid chain is always available as a fallback.
+        let _defaultLoaded = false;
+        try {
+            _defaultLoaded = await loadDefaultPreset('app-init');
+        } catch (e) {
+            console.error('[audio-engine] Default preset load threw at init; falling back to saved chain:', e);
+        }
+        if (!_defaultLoaded) {
             let savedChain;
             try {
                 savedChain = JSON.parse(localStorage.getItem('slopsmith-signal-chain') || '[]');
@@ -182,7 +189,6 @@
             }
             if (savedChain.length > 0) await refreshChain();
         }
-        await loadDefaultPreset('app-init');
     }
 
     function saveChainState() {
@@ -833,7 +839,7 @@
         if (!(await replaceChainWithPresetBlob(preset, `default:${defaultName}`))) return false;
         console.log('[audio-engine] Loaded default preset:', defaultName, 'reason:', reason);
         if (reason === 'player-exit' || reason === 'song-stop') {
-            window._preloadedSongKey = null;
+            window._toneMappingsDirty = true;
             window._toneSwitcher = null;
         }
         return true;
@@ -871,7 +877,9 @@
         if (!container) return;
         const presets = getPresets();
         const names = Object.keys(presets);
-        const defaultPresetName = ensureDefaultPresetName();
+        // Read-only — don't use ensureDefaultPresetName() here; that persists an auto-selected
+        // default and would cause loadDefaultPreset to apply it silently on the next startup.
+        const defaultPresetName = getDefaultPresetName();
         if (names.length === 0) {
             container.innerHTML = '<div class="text-xs text-slate-500 italic">No saved presets</div>';
             return;
@@ -1660,7 +1668,7 @@
                 else delete m[e.target.dataset.tone];
                 saveToneMappings(songKey, m);
                 // Force bypass preloader to rebuild mapping during current playback
-                window._preloadedSongKey = null;
+                window._toneMappingsDirty = true;
                 try {
                     await applyToneMappingsNow(songKey, { forceBypass: true, changedTone: e.target.dataset.tone });
                 } catch (err) {
@@ -1726,7 +1734,7 @@
                         try { await applyToneMappingsNow(songKey, { force: true }); } catch (e) { /* ignore */ }
                         await loadDefaultPreset('tone-automation-off');
                     }
-                    window._preloadedSongKey = null;
+                    window._toneMappingsDirty = true;
                 } else if (v === 'automation') {
                     bypassDiv?.classList.add('hidden');
                     midiDiv?.classList.add('hidden');
@@ -1735,7 +1743,7 @@
                     const cur = readTaStore();
                     cur.enabled = true;
                     writeTaStore(cur);
-                    window._preloadedSongKey = null;
+                    window._toneMappingsDirty = true;
                     await activateToneAutomationForCurrentSong();
                 } else {
                     // Preset Switch (bypass)
@@ -1749,7 +1757,7 @@
                         writeTaStore(cur);
                         await deactivateToneAutomation();
                     }
-                    window._preloadedSongKey = null;
+                    window._toneMappingsDirty = true;
                 }
             });
         }
@@ -1772,7 +1780,7 @@
                     mappings: mappingsObj,
                 });
                 // Apply MIDI mode immediately
-                window._preloadedSongKey = null;
+                window._toneMappingsDirty = true;
                 const _liveApi = window.slopsmithDesktop?.audio;
                 const _midiMappings = mappingsObj;
                 const _midiVstSlot = vstSelect ? parseInt(vstSelect.value) : -1;
@@ -2190,7 +2198,7 @@
         let _reapplyDebounceTimer = null;
         let _reapplyFollowupTimer = null;
         const scheduleReapply = () => {
-            window._preloadedSongKey = null;
+            window._toneMappingsDirty = true;
             const songKey = getCurrentSongKey();
             if (_reapplyDebounceTimer) clearTimeout(_reapplyDebounceTimer);
             if (_reapplyFollowupTimer) clearTimeout(_reapplyFollowupTimer);
@@ -2411,8 +2419,8 @@
             const midiConfig = allMappingsData.midiPC?.[songKey];
             const wantsMidi = midiConfig?.mode === 'midi';
 
-            // Check if MIDI config was just saved (clears window._preloadedSongKey)
-            if (window._preloadedSongKey === null) _preloadedToneCacheKey = null;
+            // Invalidate the preload cache when mappings changed externally (MIDI save, preset change, etc.)
+            if (window._toneMappingsDirty) { _preloadedToneCacheKey = null; window._toneMappingsDirty = false; }
 
             // Skip if already preloaded for this song+arrangement with the same mode AND timeline data is present.
             // Songs without tone_changes have a no-op switchToTone, so re-entry must force re-apply.
