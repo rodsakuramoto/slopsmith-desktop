@@ -206,7 +206,7 @@ jobs:
           if [ -z "${GH_TOKEN:-}" ]; then
             echo "::error::SLOPSMITH_SYNC_TOKEN secret is missing; cannot dispatch."
             exit 1
-          fi
+          fi  
           gh api -X POST repos/byrongamatos/slopsmith/dispatches \
             -f event_type=desktop-released \
             -f "client_payload[version]=$version"
