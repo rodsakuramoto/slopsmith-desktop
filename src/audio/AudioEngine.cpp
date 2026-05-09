@@ -421,9 +421,20 @@ bool AudioEngine::loadBackingTrack(const juce::File& file)
     backingTransport.reset();
     backingSource.reset();
 
+    const bool exists = file.existsAsFile();
+    std::cerr << "[AudioEngine] loadBackingTrack path="
+              << file.getFullPathName().toStdString()
+              << " exists=" << exists
+              << " size=" << (exists ? (long long)file.getSize() : -1)
+              << std::endl;
+
     auto* reader = formatManager.createReaderFor(file);
     if (!reader)
     {
+        std::cerr << "[AudioEngine] loadBackingTrack: no reader for ext='"
+                  << file.getFileExtension().toStdString()
+                  << "' (registered formats=" << formatManager.getNumKnownFormats()
+                  << ")" << std::endl;
         // Transport/source already reset above; clear cached state so the renderer
         // doesn't keep displaying the previous track's position/duration.
         cachedBackingPosition.store(0.0);
@@ -431,12 +442,17 @@ bool AudioEngine::loadBackingTrack(const juce::File& file)
         return false;
     }
 
+    const double readerSampleRate = reader->sampleRate;
+    const juce::int64 readerLengthInSamples = reader->lengthInSamples;
     backingSource = std::make_unique<juce::AudioFormatReaderSource>(reader, true);
     backingTransport = std::make_unique<juce::AudioTransportSource>();
-    backingTransport->setSource(backingSource.get(), 0, nullptr, reader->sampleRate);
+    backingTransport->setSource(backingSource.get(), 0, nullptr, readerSampleRate);
     backingTransport->prepareToPlay(currentBlockSize, currentSampleRate);
     cachedBackingDuration.store(backingTransport->getLengthInSeconds());
     cachedBackingPosition.store(0.0);
+    std::cerr << "[AudioEngine] loadBackingTrack OK sr=" << readerSampleRate
+              << " len=" << readerLengthInSamples
+              << std::endl;
     return true;
 }
 
