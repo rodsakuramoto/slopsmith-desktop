@@ -1,8 +1,12 @@
 #!/bin/bash
-# Bundle system binaries (ffmpeg + vgmstream-cli + fluidsynth) into
-# resources/bin/, and for fluidsynth also copy its non-system shared
-# libraries so the bundle runs on end-user systems without the
-# libfluidsynth3/libasound/libglib/etc. packages installed.
+# Bundle system binaries (ffmpeg, ffprobe, vgmstream-cli, fluidsynth)
+# into resources/bin/ along with their non-glibc shared library
+# dependencies, then set RPATH=$ORIGIN so each binary loads its
+# siblings from its own directory at runtime.
+#
+# Without this, a build host with a different ffmpeg ABI than the user
+# (e.g. Ubuntu 22.04 ffmpeg 4.x → libav*.so.58, Fedora 44 / Arch
+# ffmpeg 7.x → libav*.so.62) ships a binary the user can't load.
 #
 # Linux-only. macOS bundling runs dylibbundler inline in the CI workflow
 # because it's a different dynamic-linker story (Mach-O load paths +
@@ -21,6 +25,48 @@ BIN_DIR="$PROJECT_DIR/resources/bin"
 
 mkdir -p "$BIN_DIR"
 echo "=== Bundling system binaries ==="
+
+# patchelf is required to set RPATH=$ORIGIN on bundled binaries and
+# libs. Without that, the runtime linker on the user's machine falls
+# back to /usr/lib and fails when the host ABI doesn't match the build
+# host's. Fail here rather than letting fluidsynth's section fail later.
+if ! command -v patchelf >/dev/null 2>&1; then
+    echo "ERROR: patchelf not found on PATH (apt: patchelf) - required to set RPATH on bundled binaries." >&2
+    exit 1
+fi
+
+# is_skipped_lib() — the glibc/loader skip list, shared verbatim with
+# build-common.sh's audit so the two never drift.
+source "$SCRIPT_DIR/bundled-lib-skiplist.sh"
+
+# Copy every non-glibc shared library that the given binary links to
+# into resources/bin/. The final patchelf sweep (below) sets RPATH on
+# every binary and every .so so the directory becomes a single
+# self-contained load tree.
+bundle_with_deps() {
+    local bin_path="$1"
+    # ldd exits non-zero (and prints "not a dynamic executable") on
+    # statically linked binaries like the vgmstream-cli GitHub release.
+    # Trap that and treat it as "no deps to bundle" rather than letting
+    # pipefail kill the build.
+    local ldd_out
+    if ! ldd_out=$(ldd "$bin_path" 2>/dev/null); then
+        return 0
+    fi
+    echo "$ldd_out" | awk '/=>/ {print $3}' | while read -r lib; do
+        [ -n "$lib" ] && [ -f "$lib" ] || continue
+        if is_skipped_lib "$(basename "$lib")"; then
+            continue
+        fi
+        # -L follows symlinks; -n avoids re-copying a lib already
+        # contributed by an earlier binary (every bundled binary on
+        # the same build host links the same /usr/lib versions, so
+        # first-wins is safe). Errors are NOT suppressed: -n makes the
+        # already-bundled case a no-op exit 0, so any non-zero status
+        # here is a real copy failure that must fail the build.
+        cp -Ln "$lib" "$BIN_DIR/"
+    done
+}
 
 # ffmpeg - used for WAV → OGG transcoding on GP5 imports.
 # verify_bundled_binaries treats resources/bin/ffmpeg as required and
@@ -45,6 +91,8 @@ if ! "$BIN_DIR/ffmpeg" -hide_banner -encoders 2>/dev/null | grep -wq libvorbis; 
     exit 1
 fi
 
+bundle_with_deps "$BIN_DIR/ffmpeg"
+
 # ffprobe - demucs's audio loader spawns ffprobe before ffmpeg to read
 # stream metadata; falling through to a host-installed ffprobe (or none
 # at all) means the desktop bundle behaves differently on each user's
@@ -58,6 +106,8 @@ else
     echo "ERROR: ffprobe not found on PATH; resources/bin/ffprobe is required so demucs can read stream metadata in stem-splitting (apt: ffmpeg / brew: ffmpeg)." >&2
     exit 1
 fi
+
+bundle_with_deps "$BIN_DIR/ffprobe"
 
 # vgmstream-cli - used for Rocksmith WEM → WAV decoding.
 # Download from GitHub releases if not in PATH (CI does this inline).
@@ -98,48 +148,44 @@ else
     rm -rf /tmp/vgmstream /tmp/vgmstream.zip
 fi
 
-# vgmstream's shared libs - its binary links against libvgmstream /
-# libjansson / libmpg123 which aren't always on end-user systems.
-for lib in libvgmstream libjansson libmpg123; do
-    found=$(ldconfig -p 2>/dev/null | (grep "$lib" || true) | head -1 | awk '{print $NF}')
-    if [ -n "$found" ] && [ -f "$found" ]; then
-        cp -L "$found" "$BIN_DIR/"
-    fi
-done
+bundle_with_deps "$BIN_DIR/vgmstream-cli"
 
-# fluidsynth - used for MIDI → WAV in GP5 imports. Bundle the binary
-# AND its non-glibc shared-library dependencies so the copy works on
-# clean user machines. Set RPATH to $ORIGIN so the binary loads its
-# siblings from its own directory at runtime.
+# fluidsynth - used for MIDI → WAV in GP5 imports.
 if command -v fluidsynth >/dev/null 2>&1; then
     cp "$(which fluidsynth)" "$BIN_DIR/fluidsynth"
     echo " fluidsynth: $(ls -lh "$BIN_DIR/fluidsynth" | awk '{print $5}')"
-
-    if ! command -v patchelf >/dev/null 2>&1; then
-        echo " ERROR: patchelf not found - install it (apt: patchelf) so bundled fluidsynth can find its libs at runtime" >&2
-        exit 1
-    fi
-
-    ldd "$BIN_DIR/fluidsynth" | awk '/=>/ {print $3}' | while read -r lib; do
-        [ -n "$lib" ] && [ -f "$lib" ] || continue
-        case "$(basename "$lib")" in
-            libc.so*|libm.so*|libpthread.so*|libdl.so*|librt.so*|\
-            ld-linux*|libresolv.so*|linux-vdso*|linux-gate*|\
-            libnsl.so*|libutil.so*|libgcc_s.so*)
-                continue
-                ;;
-        esac
-        cp -L "$lib" "$BIN_DIR/"
-    done
-
-    patchelf --set-rpath '$ORIGIN' "$BIN_DIR/fluidsynth"
-    for so in "$BIN_DIR"/*.so*; do
-        [ -f "$so" ] && patchelf --set-rpath '$ORIGIN' "$so" 2>/dev/null || true
-    done
 else
     echo "ERROR: fluidsynth not found on PATH - it is required to bundle GP5 import support. Install fluidsynth and rerun this script (apt: fluidsynth)." >&2
     exit 1
 fi
+
+bundle_with_deps "$BIN_DIR/fluidsynth"
+
+# Final patchelf sweep: every dynamic binary gets RPATH=$ORIGIN, and
+# every dynamic .so does too so transitive deps also load from
+# resources/bin/. Done once at the end so the order in which binaries
+# contribute their libs doesn't matter.
+#
+# Be strict about patchelf success on dynamic binaries. The downstream
+# audit only checks lib *presence*, not RPATH — so a silent patchelf
+# failure here would ship a binary whose loader falls back to /usr/lib
+# at runtime, exactly the issue #68 regression. Detect static-vs-dynamic
+# explicitly via NEEDED entries in the .dynamic section and only skip
+# patchelf on the static case (e.g. the vgmstream-cli GitHub release).
+for bin in ffmpeg ffprobe vgmstream-cli fluidsynth; do
+    bin_path="$BIN_DIR/$bin"
+    if readelf -d "$bin_path" 2>/dev/null | grep -q '(NEEDED)'; then
+        patchelf --set-rpath '$ORIGIN' "$bin_path"
+    else
+        echo " $bin: statically linked, RPATH not applicable"
+    fi
+done
+for so in "$BIN_DIR"/*.so*; do
+    [ -f "$so" ] || continue
+    if readelf -d "$so" 2>/dev/null | grep -q '(NEEDED)'; then
+        patchelf --set-rpath '$ORIGIN' "$so"
+    fi
+done
 
 echo " Total resources/bin/: $(du -sh "$BIN_DIR" | cut -f1)"
 echo "=== Binary bundle complete ==="
